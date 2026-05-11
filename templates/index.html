@@ -1,0 +1,1423 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>币安账户面板</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <style>
+        *{margin:0;padding:0;box-sizing:border-box}
+        body{
+            font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+            background:linear-gradient(135deg,#0b0f19 0%,#1a1f2e 100%);
+            min-height:100vh;color:#e0e0e0;
+        }
+        .header{
+            background:rgba(255,255,255,0.03);
+            border-bottom:1px solid rgba(255,255,255,0.08);
+            padding:16px 32px;
+            display:flex;align-items:center;justify-content:space-between;
+        }
+        .header h1{font-size:20px;font-weight:600;color:#f0b90b;}
+        .header-right{display:flex;align-items:center;gap:12px;}
+        .last-updated{font-size:12px;color:#666;}
+        .refresh-btn{
+            background:#f0b90b;color:#0b0f19;border:none;
+            padding:8px 20px;border-radius:6px;font-size:13px;
+            font-weight:600;cursor:pointer;transition:all 0.2s;
+        }
+        .refresh-btn:hover{background:#f8d12a;}
+        .refresh-btn:disabled{opacity:0.5;cursor:not-allowed;}
+
+        .tabs{
+            display:flex;gap:0;
+            background:rgba(255,255,255,0.02);
+            border-bottom:1px solid rgba(255,255,255,0.08);
+            padding:0 32px;
+        }
+        .tab{
+            padding:14px 28px;font-size:14px;font-weight:500;
+            color:#888;cursor:pointer;border-bottom:2px solid transparent;
+            transition:all 0.2s;background:none;border-top:none;border-left:none;border-right:none;
+        }
+        .tab:hover{color:#ccc;}
+        .tab.active{color:#f0b90b;border-bottom-color:#f0b90b;}
+
+        .container{max-width:1100px;margin:0 auto;padding:24px;}
+
+        .tab-content{display:none;}
+        .tab-content.active{display:block;}
+
+        .summary-bar{display:flex;gap:16px;margin-bottom:24px;flex-wrap:wrap;}
+        .summary-card{
+            flex:1;min-width:180px;
+            background:rgba(255,255,255,0.04);
+            border:1px solid rgba(255,255,255,0.08);
+            border-radius:10px;padding:20px;
+        }
+        .summary-card .label{font-size:11px;color:#888;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;}
+        .summary-card .value{font-size:22px;font-weight:700;color:#fff;}
+        .summary-card .value.gold{color:#f0b90b;}
+
+        .table-wrap{
+            background:rgba(255,255,255,0.03);
+            border:1px solid rgba(255,255,255,0.08);
+            border-radius:12px;overflow-x:auto;
+        }
+        table{width:100%;border-collapse:collapse;}
+        thead{background:rgba(240,185,11,0.08);}
+        th{text-align:left;padding:12px 16px;font-size:11px;font-weight:600;color:#888;text-transform:uppercase;letter-spacing:1px;white-space:nowrap;}
+        th.center{text-align:center;width:50px;}
+        td{padding:10px 16px;font-size:14px;border-top:1px solid rgba(255,255,255,0.05);white-space:nowrap;}
+        td.center{text-align:center;}
+        tr:hover{background:rgba(240,185,11,0.04);}
+        .asset-name{color:#f0b90b;font-weight:600;}
+        .mono{font-variant-numeric:tabular-nums;font-family:"SF Mono","Fira Code","Consolas",monospace;}
+        .cny{color:#4ecdc4;}
+
+        .symbol-search{margin-bottom:16px;}
+        .symbol-search input{
+            width:100%;padding:12px 16px;border-radius:8px;
+            border:1px solid rgba(255,255,255,0.1);
+            background:rgba(255,255,255,0.05);color:#fff;font-size:14px;
+            outline:none;transition:border-color 0.2s;
+        }
+        .symbol-search input:focus{border-color:#f0b90b;}
+        .symbol-search input::placeholder{color:#555;}
+
+        .fav-star{
+            background:none;border:none;cursor:pointer;font-size:18px;
+            color:#333;transition:all 0.15s;padding:2px;line-height:1;
+        }
+        .fav-star:hover{color:#f0b90b;transform:scale(1.2);}
+        .fav-star.active{color:#f0b90b;}
+
+        .chart-controls{
+            display:flex;gap:12px;margin-bottom:16px;flex-wrap:wrap;align-items:center;
+        }
+
+        .tf-btns{display:flex;gap:4px;}
+        .tf-btn{
+            padding:8px 16px;border-radius:6px;font-size:13px;font-weight:500;
+            border:1px solid rgba(255,255,255,0.1);
+            background:rgba(255,255,255,0.05);color:#888;
+            cursor:pointer;transition:all 0.2s;
+        }
+        .tf-btn:hover{color:#ccc;border-color:rgba(255,255,255,0.2);}
+        .tf-btn.active{background:#f0b90b;color:#0b0f19;border-color:#f0b90b;}
+        .tf-btn:disabled{opacity:0.3;cursor:not-allowed;}
+
+        .pair-dropdown{position:relative;min-width:200px;}
+        .pair-dropdown-trigger{
+            display:flex;align-items:center;justify-content:space-between;gap:8px;
+            padding:8px 12px;border-radius:6px;font-size:13px;
+            border:1px solid rgba(255,255,255,0.1);
+            background:rgba(255,255,255,0.05);color:#fff;
+            cursor:pointer;transition:border-color 0.2s;min-width:200px;
+            user-select:none;
+        }
+        .pair-dropdown-trigger:hover{border-color:rgba(255,255,255,0.25);}
+        .pair-dropdown-trigger .arrow{font-size:10px;color:#888;transition:transform 0.2s;}
+        .pair-dropdown.open .pair-dropdown-trigger{border-color:#f0b90b;}
+        .pair-dropdown.open .arrow{transform:rotate(180deg);color:#f0b90b;}
+        .pair-dropdown-trigger .placeholder{color:#555;}
+
+        .pair-dropdown-menu{
+            display:none;position:absolute;top:calc(100% + 4px);left:0;right:0;z-index:100;
+            max-height:280px;overflow-y:auto;border-radius:8px;
+            border:1px solid rgba(255,255,255,0.1);
+            background:#1a1f2e;
+            box-shadow:0 8px 24px rgba(0,0,0,0.4);
+        }
+        .pair-dropdown.open .pair-dropdown-menu{display:block;}
+
+        .pair-dropdown-menu::-webkit-scrollbar{width:4px;}
+        .pair-dropdown-menu::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.1);border-radius:2px;}
+
+        .pair-dropdown-item{
+            padding:9px 12px;font-size:13px;color:#ccc;cursor:pointer;
+            transition:background 0.1s;display:flex;justify-content:space-between;align-items:center;
+        }
+        .pair-dropdown-item:hover{background:rgba(240,185,11,0.1);color:#f0b90b;}
+        .pair-dropdown-item.selected{background:rgba(240,185,11,0.12);color:#f0b90b;}
+        .pair-dropdown-empty{padding:16px;text-align:center;color:#555;font-size:13px;}
+
+        .chart-container{
+            background:rgba(255,255,255,0.03);
+            border:1px solid rgba(255,255,255,0.08);
+            border-radius:12px;padding:20px;
+        }
+        .chart-container canvas{width:100%!important;height:420px!important;}
+
+        .loading,.error-msg,.empty-msg{text-align:center;padding:60px 20px;}
+        .spinner{
+            width:36px;height:36px;
+            border:3px solid rgba(240,185,11,0.2);
+            border-top-color:#f0b90b;border-radius:50%;
+            animation:spin 0.8s linear infinite;margin:0 auto 16px;
+        }
+        @keyframes spin{to{transform:rotate(360deg)}}
+        .error-msg{color:#e74c3c;font-size:15px;}
+
+        .pair-row{cursor:pointer;}
+        .pair-row:hover{background:rgba(240,185,11,0.08)!important;}
+        .pair-row.selected{background:rgba(240,185,11,0.12)!important;}
+
+        .trade-btn{
+            padding:10px 28px;border-radius:6px;font-size:14px;font-weight:600;
+            border:none;cursor:pointer;transition:all 0.2s;
+        }
+        .trade-btn.primary{background:#4ecdc4;color:#0b0f19;}
+        .trade-btn.primary:hover{background:#5fe5db;}
+        .trade-btn.primary:disabled{opacity:0.4;cursor:not-allowed;}
+        .trade-btn.buy{background:#00d4aa;color:#0b0f19;}
+        .trade-btn.buy:hover{background:#00ebbc;}
+        .trade-btn.buy:disabled{opacity:0.4;cursor:not-allowed;}
+        .trade-btn.sell{background:#e74c3c;color:#fff;}
+        .trade-btn.sell:hover{background:#f55;}
+        .trade-btn.sell:disabled{opacity:0.4;cursor:not-allowed;}
+
+        .analysis-card{
+            background:rgba(255,255,255,0.03);
+            border:1px solid rgba(255,255,255,0.08);
+            border-radius:12px;padding:20px;margin-bottom:16px;
+        }
+        .analysis-card h3{font-size:16px;color:#f0b90b;margin-bottom:12px;}
+        .analysis-card .overall{color:#ccc;font-size:13px;line-height:1.6;margin-bottom:16px;padding-bottom:16px;border-bottom:1px solid rgba(255,255,255,0.06);}
+
+        .decision-row{
+            display:flex;align-items:center;justify-content:space-between;gap:12px;
+            padding:12px 16px;margin:4px 0;
+            border-radius:8px;
+            background:rgba(255,255,255,0.02);
+            border:1px solid rgba(255,255,255,0.04);
+            flex-wrap:wrap;
+        }
+        .decision-row .pair{font-weight:600;font-size:14px;min-width:80px;}
+        .decision-row .pair.BUY{color:#00d4aa;}
+        .decision-row .pair.SELL{color:#e74c3c;}
+        .decision-row .pair.HOLD{color:#888;}
+        .decision-badge{
+            display:inline-block;padding:3px 10px;border-radius:4px;font-size:11px;font-weight:600;
+        }
+        .badge-buy{background:rgba(0,212,170,0.15);color:#00d4aa;}
+        .badge-sell{background:rgba(231,76,60,0.15);color:#e74c3c;}
+        .badge-hold{background:rgba(136,136,136,0.15);color:#888;}
+        .badge-low{background:rgba(0,212,170,0.1);color:#00d4aa;}
+        .badge-mid{background:rgba(240,185,11,0.1);color:#f0b90b;}
+        .badge-high{background:rgba(231,76,60,0.1);color:#e74c3c;}
+
+        .trade-log-table td{font-size:13px;}
+        .trade-log-table .pnl-positive{color:#00d4aa;}
+        .trade-log-table .pnl-negative{color:#e74c3c;}
+        .sell-price{color:#e74c3c !important;}
+
+        .trade-section-title{
+            font-size:15px;color:#f0b90b;font-weight:600;
+            margin:24px 0 12px;padding-bottom:8px;
+            border-bottom:1px solid rgba(255,255,255,0.06);
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>币安账户面板</h1>
+        <div class="header-right">
+            <span class="last-updated" id="lastUpdated"></span>
+            <button class="refresh-btn" id="refreshBtn" onclick="refreshCurrentTab()">刷新</button>
+        </div>
+    </div>
+
+    <div class="tabs">
+        <button class="tab active" onclick="switchTab('balance')">余额</button>
+        <button class="tab" onclick="switchTab('symbols')">交易对</button>
+        <button class="tab" onclick="switchTab('chart')">走势图</button>
+        <button class="tab" onclick="switchTab('manual')">手动交易</button>
+        <button class="tab" onclick="switchTab('autotrade')">自动交易</button>
+    </div>
+
+    <div class="container">
+        <div class="tab-content active" id="tab-balance">
+            <div class="summary-bar" id="summaryBar"></div>
+            <div class="table-wrap" id="balanceTable"></div>
+            <div class="chart-container" id="balanceChartWrap" style="margin-top:20px;display:none;">
+                <canvas id="balanceChart"></canvas>
+            </div>
+        </div>
+
+        <div class="tab-content" id="tab-symbols">
+            <div class="symbol-search">
+                <input type="text" placeholder="搜索交易对，例如 BTC、ETH..." id="symbolSearch" oninput="filterSymbols()">
+            </div>
+            <div class="table-wrap" id="symbolsTable"></div>
+            <div class="pagination" id="symbolPager"></div>
+        </div>
+
+        <div class="tab-content" id="tab-chart">
+            <div class="chart-controls">
+                <div class="pair-dropdown" id="pairDropdown">
+                    <div class="pair-dropdown-trigger" onclick="toggleDropdown()">
+                        <span id="pairDropdownLabel" class="placeholder">选择交易对...</span>
+                        <span class="arrow">▼</span>
+                    </div>
+                    <div class="pair-dropdown-menu" id="pairDropdownMenu"></div>
+                </div>
+                <div class="tf-btns">
+                    <button class="tf-btn" data-interval="1m" data-limit="60" data-label="1小时" onclick="selectTimeframe(this)">1小时</button>
+                    <button class="tf-btn" data-interval="1h" data-limit="24" data-label="1天" onclick="selectTimeframe(this)">1天</button>
+                    <button class="tf-btn" data-interval="1h" data-limit="168" data-label="1周" onclick="selectTimeframe(this)">1周</button>
+                    <button class="tf-btn active" data-interval="4h" data-limit="180" data-label="1月" onclick="selectTimeframe(this)">1月</button>
+                    <button class="tf-btn" data-interval="1d" data-limit="365" data-label="1年" onclick="selectTimeframe(this)">1年</button>
+                </div>
+            </div>
+            <div class="chart-container">
+                <canvas id="klineChart"></canvas>
+            </div>
+        </div>
+
+        <div class="tab-content" id="tab-manual">
+            <div class="chart-controls">
+                <div class="pair-dropdown" id="manualPairDropdown" style="min-width:180px;">
+                    <div class="pair-dropdown-trigger" onclick="toggleManualDropdown()">
+                        <span id="manualPairLabel" class="placeholder">选择交易对...</span>
+                        <span class="arrow">▼</span>
+                    </div>
+                    <div class="pair-dropdown-menu" id="manualPairMenu"></div>
+                </div>
+                <span id="manualPrice" style="font-size:18px;font-weight:700;color:#fff;">--</span>
+                <span id="manualChange" style="font-size:14px;"></span>
+            </div>
+            <div style="display:flex;gap:16px;flex-wrap:wrap;">
+                <div style="flex:1;min-width:280px;">
+                    <div class="analysis-card" style="margin-bottom:12px;">
+                        <div class="trade-section-title" style="margin-top:0;">⚡ 下单</div>
+                        <div style="display:flex;gap:8px;margin-bottom:10px;">
+                            <button class="trade-btn buy" id="btnBuyMarket" onclick="setManualSide('BUY')" style="flex:1;">买入</button>
+                            <button class="trade-btn sell" id="btnSellMarket" onclick="setManualSide('SELL')" style="flex:1;">卖出</button>
+                        </div>
+                        <div style="color:#888;font-size:12px;margin-bottom:8px;">
+                            可用: <span id="manualBaseFree" style="color:#ccc;">--</span> | USDT: <span id="manualQuoteFree" style="color:#ccc;">--</span>
+                        </div>
+                        <div style="margin-bottom:8px;">
+                            <label style="color:#888;font-size:11px;">数量</label>
+                            <input type="number" id="manualQty" placeholder="0.00" step="any" style="width:100%;padding:10px 12px;border-radius:6px;border:1px solid rgba(255,255,255,0.1);background:rgba(255,255,255,0.05);color:#fff;font-size:15px;outline:none;" oninput="updateManualEstimate()">
+                        </div>
+                        <div style="display:flex;gap:4px;margin-bottom:10px;flex-wrap:wrap;">
+                            <button class="tf-btn" onclick="setManualQtyPercent(25)">25%</button>
+                            <button class="tf-btn" onclick="setManualQtyPercent(50)">50%</button>
+                            <button class="tf-btn" onclick="setManualQtyPercent(75)">75%</button>
+                            <button class="tf-btn" onclick="setManualQtyPercent(100)">100%</button>
+                        </div>
+                        <div style="color:#aaa;font-size:12px;margin-bottom:12px;" id="manualEstimate">预估: -- USDT</div>
+                        <button class="trade-btn buy" id="btnSubmitOrder" onclick="submitManualOrder()" style="width:100%;padding:12px;" disabled>下单交易</button>
+                    </div>
+                    <div class="analysis-card">
+                        <div class="trade-section-title" style="margin-top:0;">📊 当前持仓</div>
+                        <div id="manualPosition" style="color:#888;font-size:13px;">选择交易对后显示</div>
+                    </div>
+                </div>
+                <div style="flex:1;min-width:280px;">
+                    <div class="analysis-card" style="margin-bottom:12px;">
+                        <div class="trade-section-title" style="margin-top:0;">📖 订单簿</div>
+                        <div style="font-size:12px;" id="manualDepth"></div>
+                    </div>
+                </div>
+            </div>
+            <div class="trade-section-title">📜 最近成交</div>
+            <div class="table-wrap" id="manualRecentTrades"></div>
+        </div>
+
+        <div class="tab-content" id="tab-autotrade">
+            <div class="summary-bar" id="tradeSummary"></div>
+            <div id="tradeAnalysis"></div>
+            <div id="tradeConfirmBar" style="display:none;"></div>
+            <div id="tradeProgress" style="display:none;"></div>
+            <div class="trade-section-title">📋 交易记录</div>
+            <div class="table-wrap" id="tradeLogTable"></div>
+            <div class="trade-section-title">📊 盈亏汇总</div>
+            <div class="table-wrap" id="tradePnlTable"></div>
+        </div>
+    </div>
+
+    <script>
+        const AUTH_TOKEN = "{{ access_token }}";
+
+        (function() {
+            const _fetch = window.fetch;
+            window.fetch = function(url, options = {}) {
+                options.headers = options.headers || {};
+                options.headers["Authorization"] = "Bearer " + AUTH_TOKEN;
+                return _fetch(url, options);
+            };
+        })();
+
+        const PAGE_SIZE = 50;
+        let currentTab = "balance";
+        let allSymbols = [];
+        let filteredSymbols = [];
+        let symbolPage = 1;
+        let chartInstance = null;
+        let currentPair = "";
+        let currentInterval = "4h";
+        let currentLimit = 180;
+        let favorites = new Set();
+        let favLoaded = false;
+
+        async function loadFavorites() {
+            try {
+                const resp = await fetch("/api/favorites");
+                if (!resp.ok) return;
+                const data = await resp.json();
+                favorites = new Set(data);
+                favLoaded = true;
+            } catch (e) {
+                console.error(e);
+            }
+        }
+
+        async function toggleFavorite(symbol) {
+            try {
+                const resp = await fetch("/api/favorites/toggle", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ symbol: symbol }),
+                });
+                if (!resp.ok) return;
+                const data = await resp.json();
+                favorites = new Set(data.favorites);
+                if (currentTab === "symbols") renderSymbols(filteredSymbols);
+                if (currentTab === "chart") populateChartPairs();
+            } catch (e) {
+                console.error(e);
+            }
+        }
+
+        function switchTab(tab) {
+            currentTab = tab;
+            document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+            document.querySelectorAll(".tab-content").forEach(c => c.classList.remove("active"));
+            const idx = {'balance':1,'symbols':2,'chart':3,'manual':4,'autotrade':5}[tab] || 1;
+            document.querySelector(`.tab:nth-child(${idx})`).classList.add("active");
+            document.getElementById("tab-" + tab).classList.add("active");
+
+            if (tab === "balance") fetchBalance();
+            if (tab === "symbols" && allSymbols.length === 0) fetchSymbols();
+            if (tab === "chart" && allSymbols.length === 0) fetchSymbols().then(() => populateChartPairs());
+            if (tab === "chart" && allSymbols.length > 0) populateChartPairs();
+            if (tab === "chart" && currentPair) fetchKlines();
+            if (tab === "manual") initManualTrade();
+            if (tab === "autotrade") loadTradePage();
+        }
+
+        function refreshCurrentTab() {
+            if (currentTab === "balance") fetchBalance();
+            if (currentTab === "symbols") fetchSymbols();
+            if (currentTab === "chart" && currentPair) fetchKlines();
+        }
+
+        function fmtNum(n, dec) {
+            if (n === undefined || n === null) return "0";
+            const num = Number(n);
+            if (num === 0) return "0";
+            const d = dec !== undefined ? dec : (num >= 100 ? 2 : num >= 1 ? 4 : 8);
+            return num.toLocaleString("en-US", {minimumFractionDigits:d,maximumFractionDigits:d});
+        }
+
+        function nowStr() {
+            return new Date().toLocaleTimeString("zh-CN");
+        }
+
+        async function fetchBalance() {
+            const el = document.getElementById("balanceTable");
+            const sb = document.getElementById("summaryBar");
+            el.innerHTML = '<div class="loading"><div class="spinner"></div><div>加载中...</div></div>';
+            sb.innerHTML = "";
+
+            try {
+                const resp = await fetch("/api/balance");
+                if (!resp.ok) {
+                    const d = await resp.json();
+                    throw new Error(d.error || `HTTP ${resp.status}`);
+                }
+                const data = await resp.json();
+                const balances = data.balances || [];
+
+                if (!favLoaded) await loadFavorites();
+
+                if (balances.length === 0) {
+                    el.innerHTML = '<div class="empty-msg">没有非零余额的资产</div>';
+                    return;
+                }
+
+                sb.innerHTML = `
+                    <div class="summary-card">
+                        <div class="label">估算总资产 (CNY)</div>
+                        <div class="value gold">¥ ${fmtNum(data.totalCny, 2)}</div>
+                    </div>
+                    <div class="summary-card">
+                        <div class="label">持有币种</div>
+                        <div class="value">${balances.length}</div>
+                    </div>
+                    <div class="summary-card">
+                        <div class="label">USD/CNY 汇率</div>
+                        <div class="value">${data.cnyRate}</div>
+                    </div>
+                `;
+
+                el.innerHTML = `
+                <table>
+                    <thead>
+                        <tr>
+                            <th>资产</th><th>可用</th><th>冻结</th><th>总计</th>
+                            <th>价格 (USDT)</th><th>估值 (CNY)</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${balances.map(b => `
+                        <tr>
+                            <td><span class="asset-name">${b.asset}</span></td>
+                            <td class="mono">${fmtNum(b.free)}</td>
+                            <td class="mono">${fmtNum(b.locked)}</td>
+                            <td class="mono">${fmtNum(b.total)}</td>
+                            <td class="mono">${b.usdtPrice > 0 ? '$'+fmtNum(b.usdtPrice) : '-'}</td>
+                            <td class="mono cny">¥${fmtNum(b.cnyValue, 2)}</td>
+                        </tr>`).join("")}
+                    </tbody>
+                </table>`;
+
+                document.getElementById("lastUpdated").textContent = "更新于 " + nowStr();
+                fetchBalanceHistory();
+            } catch (err) {
+                el.innerHTML = `<div class="error-msg">${err.message}</div>`;
+            }
+        }
+
+        async function fetchSymbols() {
+            const el = document.getElementById("symbolsTable");
+            el.innerHTML = '<div class="loading"><div class="spinner"></div><div>加载中...</div></div>';
+            document.getElementById("symbolPager").innerHTML = "";
+
+            try {
+                const resp = await fetch("/api/symbols");
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                allSymbols = await resp.json();
+                if (!favLoaded) await loadFavorites();
+                filteredSymbols = allSymbols;
+                symbolPage = 1;
+                renderSymbols(filteredSymbols);
+            } catch (err) {
+                el.innerHTML = `<div class="error-msg">${err.message}</div>`;
+            }
+        }
+
+        function renderSymbols(list) {
+            const el = document.getElementById("symbolsTable");
+            if (list.length === 0) {
+                el.innerHTML = '<div class="empty-msg">无匹配交易对</div>';
+                document.getElementById("symbolPager").innerHTML = "";
+                return;
+            }
+
+            const totalPages = Math.ceil(list.length / PAGE_SIZE);
+            if (symbolPage > totalPages) symbolPage = totalPages;
+            const start = (symbolPage - 1) * PAGE_SIZE;
+            const pageItems = list.slice(start, start + PAGE_SIZE);
+
+            el.innerHTML = `
+            <table>
+                <thead><tr><th class="center">收藏</th><th>交易对</th><th>基础资产</th><th>计价资产</th></tr></thead>
+                <tbody>
+                    ${pageItems.map(s => {
+                        const isFav = favorites.has(s.symbol);
+                        return `
+                    <tr class="pair-row" data-pair="${s.symbol}">
+                        <td class="center"><button class="fav-star${isFav?' active':''}" onclick="event.stopPropagation();toggleFavorite('${s.symbol}')">★</button></td>
+                        <td onclick="selectPair('${s.symbol}')"><span class="asset-name">${s.symbol}</span></td>
+                        <td onclick="selectPair('${s.symbol}')">${s.baseAsset}</td>
+                        <td onclick="selectPair('${s.symbol}')">${s.quoteAsset}</td>
+                    </tr>`}).join("")}
+                </tbody>
+            </table>`;
+
+            let pagerHtml = `<div style="display:flex;align-items:center;justify-content:center;gap:6px;padding:16px;color:#888;font-size:13px;">`;
+            pagerHtml += `<button class="tf-btn" onclick="goPage(1)" ${symbolPage===1?'disabled':''}>|<</button>`;
+            pagerHtml += `<button class="tf-btn" onclick="goPage(${symbolPage-1})" ${symbolPage<=1?'disabled':''}><</button>`;
+
+            const maxBtns = 7;
+            let pStart = Math.max(1, symbolPage - 3);
+            let pEnd = Math.min(totalPages, pStart + maxBtns - 1);
+            if (pEnd - pStart < maxBtns - 1) pStart = Math.max(1, pEnd - maxBtns + 1);
+
+            for (let i = pStart; i <= pEnd; i++) {
+                pagerHtml += `<button class="tf-btn${i===symbolPage?' active':''}" onclick="goPage(${i})">${i}</button>`;
+            }
+
+            pagerHtml += `<button class="tf-btn" onclick="goPage(${symbolPage+1})" ${symbolPage>=totalPages?'disabled':''}>></button>`;
+            pagerHtml += `<button class="tf-btn" onclick="goPage(${totalPages})" ${symbolPage===totalPages?'disabled':''}>>|</button>`;
+            pagerHtml += `<span style="margin-left:12px;">共 ${list.length} 个 / ${totalPages} 页</span>`;
+            pagerHtml += `</div>`;
+            document.getElementById("symbolPager").innerHTML = pagerHtml;
+        }
+
+        function goPage(p) {
+            if (p < 1) return;
+            const totalPages = Math.ceil(filteredSymbols.length / PAGE_SIZE);
+            if (p > totalPages) return;
+            symbolPage = p;
+            renderSymbols(filteredSymbols);
+        }
+
+        function filterSymbols() {
+            const q = document.getElementById("symbolSearch").value.toUpperCase();
+            if (!q) {
+                filteredSymbols = allSymbols;
+            } else {
+                filteredSymbols = allSymbols.filter(s => s.symbol.includes(q));
+            }
+            symbolPage = 1;
+            renderSymbols(filteredSymbols);
+        }
+
+        function selectPair(symbol) {
+            document.querySelectorAll(".pair-row").forEach(r => r.classList.remove("selected"));
+            const row = document.querySelector(`.pair-row[data-pair="${symbol}"]`);
+            if (row) row.classList.add("selected");
+            switchTab("chart");
+            currentPair = symbol;
+            updateDropdownLabel();
+            fetchKlines();
+        }
+
+        function toggleDropdown() {
+            const dd = document.getElementById("pairDropdown");
+            dd.classList.toggle("open");
+            if (dd.classList.contains("open")) {
+                populateChartPairs();
+            }
+        }
+
+        function selectDropdownPair(symbol) {
+            currentPair = symbol;
+            updateDropdownLabel();
+            document.getElementById("pairDropdown").classList.remove("open");
+            fetchKlines();
+        }
+
+        function updateDropdownLabel() {
+            const label = document.getElementById("pairDropdownLabel");
+            if (currentPair) {
+                label.textContent = currentPair;
+                label.classList.remove("placeholder");
+            } else {
+                label.textContent = "选择交易对...";
+                label.classList.add("placeholder");
+            }
+        }
+
+        function populateChartPairs() {
+            const menu = document.getElementById("pairDropdownMenu");
+            const favPairs = allSymbols.filter(s => favorites.has(s.symbol));
+            const sorted = favPairs.sort((a, b) => a.symbol.localeCompare(b.symbol));
+
+            if (sorted.length === 0) {
+                menu.innerHTML = '<div class="pair-dropdown-empty">暂无收藏交易对<br><span style="font-size:11px;">请在交易对页面点击 ★ 添加</span></div>';
+                return;
+            }
+
+            menu.innerHTML = sorted.map(s => `
+                <div class="pair-dropdown-item${s.symbol===currentPair?' selected':''}" onclick="selectDropdownPair('${s.symbol}')">
+                    <span>${s.symbol}</span>
+                    <span style="color:#555;font-size:11px;">${s.baseAsset}/${s.quoteAsset}</span>
+                </div>
+            `).join("");
+        }
+
+        function onChartPairChange() {
+            currentPair = document.getElementById("chartPair").value;
+            if (currentPair) fetchKlines();
+        }
+
+        function selectTimeframe(btn) {
+            document.querySelectorAll(".tf-btn").forEach(b => b.classList.remove("active"));
+            btn.classList.add("active");
+            currentInterval = btn.dataset.interval;
+            currentLimit = parseInt(btn.dataset.limit);
+            if (currentPair) fetchKlines();
+        }
+
+        async function fetchKlines() {
+            if (!currentPair) return;
+            const canvas = document.getElementById("klineChart");
+            const ctx = canvas.getContext("2d");
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            if (chartInstance) { chartInstance.destroy(); chartInstance = null; }
+
+            ctx.font = "14px sans-serif";
+            ctx.fillStyle = "#666";
+            ctx.textAlign = "center";
+            ctx.fillText("加载中...", canvas.width/2, canvas.height/2);
+
+            try {
+                const resp = await fetch(`/api/klines?symbol=${currentPair}&interval=${currentInterval}&limit=${currentLimit}`);
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                const data = await resp.json();
+                if (!Array.isArray(data) || data.length === 0) {
+                    ctx.clearRect(0, 0, canvas.width, canvas.height);
+                    ctx.fillText("无数据", canvas.width/2, canvas.height/2);
+                    return;
+                }
+
+                drawKlineChart(data);
+                document.getElementById("lastUpdated").textContent = "更新于 " + nowStr();
+            } catch (err) {
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                ctx.fillStyle = "#e74c3c";
+                ctx.fillText(err.message, canvas.width/2, canvas.height/2);
+            }
+        }
+
+        function drawKlineChart(data) {
+            const canvas = document.getElementById("klineChart");
+            const container = canvas.parentElement;
+            canvas.width = container.clientWidth - 40;
+            canvas.height = 420;
+            const ctx = canvas.getContext("2d");
+
+            if (chartInstance) chartInstance.destroy();
+
+            const labels = data.map(d => {
+                const dt = new Date(d.time);
+                if (currentInterval === "1m") return dt.toLocaleTimeString("zh-CN", {hour:"2-digit",minute:"2-digit"});
+                if (currentInterval === "1h") {
+                    const h = dt.toLocaleTimeString("zh-CN", {hour:"2-digit",minute:"2-digit"});
+                    const date = dt.toLocaleDateString("zh-CN", {month:"short",day:"numeric"});
+                    return date + " " + h;
+                }
+                return dt.toLocaleDateString("zh-CN", {month:"short",day:"numeric"});
+            });
+
+            chartInstance = new Chart(ctx, {
+                type: "line",
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        label: currentPair + " 收盘价",
+                        data: data.map(d => d.close),
+                        borderColor: "#f0b90b",
+                        backgroundColor: "rgba(240,185,11,0.08)",
+                        borderWidth: 1.5,
+                        fill: true,
+                        pointRadius: 0,
+                        tension: 0,
+                    }],
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: {
+                        intersect: false,
+                        mode: "index",
+                    },
+                    plugins: {
+                        legend: {
+                            labels: { color: "#888", font: { size: 12 } },
+                        },
+                        tooltip: {
+                            backgroundColor: "rgba(20,22,30,0.95)",
+                            titleColor: "#f0b90b",
+                            bodyColor: "#e0e0e0",
+                            borderColor: "rgba(255,255,255,0.1)",
+                            borderWidth: 1,
+                            callbacks: {
+                                title: function(items) { return currentPair + " 走势"; },
+                                label: function(item) {
+                                    const idx = item.dataIndex;
+                                    const d = data[idx];
+                                    const dt = new Date(d.time);
+                                    return [
+                                        "时间: " + dt.toLocaleString("zh-CN"),
+                                        "开: " + fmtNum(d.open),
+                                        "高: " + fmtNum(d.high),
+                                        "低: " + fmtNum(d.low),
+                                        "收: " + fmtNum(d.close),
+                                    ];
+                                },
+                            },
+                        },
+                    },
+                    scales: {
+                        x: {
+                            ticks: { color: "#555", maxTicksLimit: 10, font: { size: 10 } },
+                            grid: { color: "rgba(255,255,255,0.04)" },
+                        },
+                        y: {
+                            ticks: { color: "#555", font: { size: 10 }, callback: v => fmtNum(v) },
+                            grid: { color: "rgba(255,255,255,0.04)" },
+                        },
+                    },
+                },
+            });
+        }
+
+        document.addEventListener("click", function(e) {
+            const dd = document.getElementById("pairDropdown");
+            if (!dd) return;
+            if (!dd.contains(e.target)) {
+                dd.classList.remove("open");
+            }
+        });
+
+        let tradeAnalysisData = null;
+        let isExecutingAll = false;
+
+        async function loadTradePage() {
+            document.getElementById("tradeSummary").innerHTML = '<div class="loading"><div class="spinner"></div><div>加载中...</div></div>';
+            document.getElementById("tradeLogTable").innerHTML = '<div class="loading"><div class="spinner"></div></div>';
+            document.getElementById("tradePnlTable").innerHTML = '<div class="loading"><div class="spinner"></div></div>';
+            if (tradeAnalysisData) {
+                renderFullAnalysis(tradeAnalysisData);
+                renderConfirmBar(tradeAnalysisData);
+            } else {
+                resetTradeUI();
+            }
+            await Promise.all([loadTradeHistory(), loadTradePairsInfo()]);
+        }
+
+        function resetTradeUI() {
+            document.getElementById("tradeAnalysis").innerHTML = "";
+            document.getElementById("tradeConfirmBar").style.display = "none";
+            document.getElementById("tradeProgress").style.display = "none";
+        }
+
+        async function loadTradePairsInfo() {
+            try {
+                const resp = await fetch("/api/trade/pairs");
+                if (!resp.ok) return;
+                const pairs = await resp.json();
+                document.getElementById("tradeSummary").innerHTML = `
+                    <div class="summary-card">
+                        <div class="label">交易币对</div>
+                        <div class="value" style="font-size:14px;">${pairs.join(" / ")}</div>
+                    </div>
+                    <div class="summary-card">
+                        <div class="label">操作</div>
+                        <div class="value" style="display:flex;gap:8px;flex-wrap:wrap;">
+                            <button class="trade-btn primary" onclick="runAnalysis()">📊 开始分析</button>
+                        </div>
+                    </div>
+                `;
+                document.getElementById("lastUpdated").textContent = "更新于 " + nowStr();
+                document.getElementById("tradeLogTable").innerHTML = '<div class="loading"><div class="spinner"></div></div>';
+                document.getElementById("tradePnlTable").innerHTML = '<div class="loading"><div class="spinner"></div></div>';
+            } catch (e) {
+                document.getElementById("tradeSummary").innerHTML = `<div class="error-msg">${e.message}</div>`;
+            }
+        }
+
+        async function doAnalysis() {
+            const sumBar = document.getElementById("tradeSummary");
+            document.getElementById("tradeAnalysis").innerHTML = "";
+            document.getElementById("tradeConfirmBar").style.display = "none";
+            document.getElementById("tradeProgress").style.display = "none";
+            tradeAnalysisData = null;
+
+            let logHtml = `<div class="analysis-card" style="max-height:500px;overflow-y:auto;font-size:12px;font-family:'SF Mono','Fira Code','Consolas',monospace;" id="liveLog"><div class="trade-section-title" style="margin-top:0;">📺 实时分析过程</div><div id="logLines">`;
+            logHtml += `<div style="color:#888;">⏳ 正在连接...</div>`;
+            logHtml += `</div></div>`;
+            sumBar.innerHTML = logHtml;
+
+            const logLines = () => document.getElementById("logLines");
+            function addLog(msg, color) {
+                const el = logLines();
+                if (!el) return;
+                const div = document.createElement("div");
+                div.style.cssText = `color:${color||'#ccc'};padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.03);`;
+                div.textContent = msg;
+                el.appendChild(div);
+                const liveLog = document.getElementById("liveLog");
+                if (liveLog) liveLog.scrollTop = liveLog.scrollHeight;
+            }
+
+            let collectPairs = [];
+
+            try {
+                const resp = await fetch("/api/trade/analyze-stream");
+                const reader = resp.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = "";
+
+                while (true) {
+                    const {done, value} = await reader.read();
+                    if (done) break;
+                    buffer += decoder.decode(value, {stream: true});
+                    const lines = buffer.split("\n");
+                    buffer = lines.pop();
+                    for (const line of lines) {
+                        if (!line.trim()) continue;
+                        try {
+                            const evt = JSON.parse(line);
+                            handleSSEEvent(evt, addLog, () => collectPairs);
+                        } catch (e) { /* skip bad json */ }
+                    }
+                }
+            } catch (err) {
+                addLog(`❌ 分析失败: ${err.message}`, "#e74c3c");
+            }
+            loadTradePairsInfo();
+        }
+
+        function handleSSEEvent(evt, addLog, getCollectPairs) {
+            const e = evt.event;
+            if (e === "log") {
+                addLog(evt.msg, "#888");
+            } else if (e === "collect_pair") {
+                const change = evt.change;
+                const changeColor = change > 0 ? "#00d4aa" : change < 0 ? "#e74c3c" : "#888";
+                const changeStr = change !== null && change !== undefined ? `  ${change>=0?'+':''}${change}%` : "";
+                addLog(`  📊 ${evt.pair} 当前价 ${evt.price ?? '?'}${changeStr ? ' '+changeStr : ''}`, changeStr ? changeColor : "#aaa");
+            } else if (e === "balance") {
+                addLog("💰 账户余额已获取", "#f0b90b");
+                evt.data && evt.data.forEach(b => {
+                    addLog(`    ${b.asset}: ${b.total} (≈¥${b.cnyValue})`, "#4ecdc4");
+                });
+            } else if (e === "search_round") {
+                if (evt.status === "asking") {
+                    addLog(`🔍 第${evt.round}轮搜索: 询问 DeepSeek Flash 搜索方向...`, "#f0b90b");
+                } else if (evt.status === "skip") {
+                    addLog(`  ⏭ ${evt.msg}`, "#888");
+                }
+            } else if (e === "search_query") {
+                addLog(`  📋 第${evt.round}轮搜索关键词: ${evt.queries.join(', ')}`, "#4ecdc4");
+            } else if (e === "searching") {
+                addLog(`    🔎 搜索: "${evt.query}"...`, "#aaa");
+            } else if (e === "search_found") {
+                addLog(`    ✅ 搜索 "${evt.query}" → ${evt.count} 条结果`, "#00d4aa");
+                if (evt.preview) addLog(`       预览: ${evt.preview}`, "#555");
+            } else if (e === "summarizing") {
+                addLog(`    📝 DeepSeek Flash 正在总结 ${evt.count} 条搜索结果...`, "#f0b90b");
+            } else if (e === "search_summary") {
+                addLog(`    📝 搜索结果总结:`, "#f0b90b");
+                addLog(`       ${evt.summary}`, "#ccc");
+            } else if (e === "search_error") {
+                addLog(`    ⚠ 搜索出错: ${evt.error}`, "#e74c3c");
+            } else if (e === "pro_start") {
+                addLog("", "#888");
+                addLog("🤖 DeepSeek-V4-Pro 最终决策中...", "#f0b90b");
+                addLog("   (正在分析市场数据 + 搜索情报，生成交易建议)", "#888");
+            } else if (e === "pro_done") {
+                addLog(`✅ DeepSeek-V4-Pro 返回 ${evt.length} 字符响应`, "#00d4aa");
+            } else if (e === "decisions") {
+                addLog("📊 分析结果 ↓", "#f0b90b");
+                evt.decisions && evt.decisions.forEach(d => {
+                    const c = d.action === "BUY" ? "#00d4aa" : d.action === "SELL" ? "#e74c3c" : "#888";
+                    addLog(`   ${d.symbol} → ${d.action} (${d.trend||'?'}) 风险:${d.risk||'?'} qty=${d.quantity} ≈${d.estimatedUsdt||0}USDT`, c);
+                    addLog(`      ${d.reason||''}`, "#aaa");
+                });
+            } else if (e === "done") {
+                addLog("", "#888");
+                addLog("✅ 分析完成！", "#00d4aa");
+                tradeAnalysisData = {marketData: evt.marketData, analysis: evt.analysis};
+                renderFullAnalysis(tradeAnalysisData);
+                renderConfirmBar(tradeAnalysisData);
+                document.getElementById("lastUpdated").textContent = "分析于 " + nowStr();
+            } else if (e === "error") {
+                addLog(`❌ ${evt.error}`, "#e74c3c");
+            }
+        }
+
+        async function runAnalysis() {
+            await doAnalysis();
+        }
+
+        function renderFullAnalysis(data) {
+            const analysis = data.analysis || {};
+            const decisions = analysis.decisions || [];
+            const overall = analysis.overall_analysis || "无分析结果";
+            const research = analysis.research_summary || "";
+
+            const actionSummary = {};
+            decisions.forEach(d => {
+                const a = d.action || "HOLD";
+                actionSummary[a] = (actionSummary[a] || 0) + 1;
+            });
+            const summaryBadges = Object.entries(actionSummary).map(([k, v]) => {
+                const cls = k === "BUY" ? "badge-buy" : k === "SELL" ? "badge-sell" : "badge-hold";
+                return `<span class="decision-badge ${cls}">${k}: ${v}</span>`;
+            }).join(" ");
+
+            const totalBuyUsdt = decisions
+                .filter(d => d.action === "BUY")
+                .reduce((s, d) => s + (parseFloat(d.estimatedUsdt) || 0), 0);
+
+            let html = `
+            <div class="analysis-card">
+                <h3>🤖 DeepSeek 分析报告 <span style="font-size:11px;color:#666;font-weight:normal;">(Flash搜索 + Pro决策)</span></h3>
+                <div style="margin-bottom:12px;">${summaryBadges} ${totalBuyUsdt > 0 ? `<span style="color:#00d4aa;font-size:12px;margin-left:8px;">建议买入总额: ≈ ${fmtNum(totalBuyUsdt, 2)} USDT</span>` : ''}</div>
+                ${research ? `<div style="color:#4ecdc4;font-size:12px;margin-bottom:12px;padding:8px 12px;background:rgba(78,205,196,0.06);border-radius:6px;">🌐 ${research}</div>` : ""}
+                <div class="overall">${overall}</div>
+                ${decisions.map(d => renderDecisionCard(d)).join("")}
+            </div>`;
+            document.getElementById("tradeAnalysis").innerHTML = html;
+        }
+
+        function renderDecisionCard(d) {
+            const action = d.action || "HOLD";
+            const actionClass = action;
+            const badgeClass = action === "BUY" ? "badge-buy" : action === "SELL" ? "badge-sell" : "badge-hold";
+            const riskClass = d.risk === "低" ? "badge-low" : d.risk === "高" ? "badge-high" : "badge-mid";
+            const est = d.estimatedUsdt ? `≈ ${fmtNum(d.estimatedUsdt, 2)} USDT` : "";
+            const sl = d.stopLossPrice ? `止损: ${fmtNum(d.stopLossPrice)}` : "";
+
+            return `
+            <div class="decision-row" style="flex-direction:column;align-items:stretch;gap:8px;">
+                <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
+                    <span class="pair ${actionClass}">${d.symbol}</span>
+                    <span style="color:#aaa;">趋势: ${d.trend || "-"}</span>
+                    <span class="decision-badge ${badgeClass}">${action}</span>
+                    <span style="color:#ccc;">数量: ${d.quantity || "0"}</span>
+                    ${est ? `<span style="color:#00d4aa;">${est}</span>` : ""}
+                    ${sl ? `<span style="color:#e74c3c;font-size:12px;">${sl}</span>` : ""}
+                    <span class="decision-badge ${riskClass}">风险 ${d.risk || "-"}</span>
+                </div>
+                <div style="color:#aaa;font-size:12px;">${d.reason || ""}</div>
+                ${d.detail ? `<div style="color:#666;font-size:11px;padding:6px 8px;background:rgba(255,255,255,0.02);border-radius:4px;">📝 ${d.detail}</div>` : ""}
+            </div>`;
+        }
+
+        function renderConfirmBar(data) {
+            const decisions = (data.analysis || {}).decisions || [];
+            const actionable = decisions.filter(d => d.action === "BUY" || d.action === "SELL");
+            if (actionable.length === 0) {
+                document.getElementById("tradeConfirmBar").style.display = "none";
+                return;
+            }
+            const totalEst = actionable.reduce((s, d) => s + (parseFloat(d.estimatedUsdt) || 0), 0);
+            document.getElementById("tradeConfirmBar").style.display = "block";
+            document.getElementById("tradeConfirmBar").innerHTML = `
+            <div class="analysis-card" style="border-color:rgba(0,212,170,0.2);background:rgba(0,212,170,0.03);">
+                <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;">
+                    <div>
+                        <span style="color:#00d4aa;font-weight:600;">共 ${actionable.length} 笔交易建议</span>
+                        <span style="color:#ccc;margin-left:8px;">预计总金额: ≈ ${fmtNum(totalEst, 2)} USDT</span>
+                    </div>
+                    <button class="trade-btn buy" onclick="confirmAndExecuteAll()" style="padding:12px 32px;font-size:14px;">
+                        ✅ 同意建议，开始一键交易
+                    </button>
+                </div>
+            </div>`;
+        }
+
+        async function confirmAndExecuteAll() {
+            if (!tradeAnalysisData) return;
+            const decisions = (tradeAnalysisData.analysis || {}).decisions || [];
+            const actionable = decisions.filter(d => d.action === "BUY" || d.action === "SELL");
+
+            let confirmMsg = "即将执行以下交易:\n\n";
+            actionable.forEach(d => {
+                confirmMsg += `  ${d.action} ${d.symbol} x ${d.quantity} ≈ ${d.estimatedUsdt || 0} USDT\n`;
+            });
+            confirmMsg += "\n确认执行？";
+
+            if (!confirm(confirmMsg)) return;
+
+            document.getElementById("tradeConfirmBar").style.display = "none";
+            isExecutingAll = true;
+
+            const progressDiv = document.getElementById("tradeProgress");
+            progressDiv.style.display = "block";
+            progressDiv.innerHTML = `
+            <div class="analysis-card">
+                <h3>⏳ 交易执行中...</h3>
+                <div id="progressList">
+                    ${actionable.map(d => `
+                    <div class="decision-row" id="prog-${d.symbol}">
+                        <span class="pair ${d.action}">${d.symbol}</span>
+                        <span>${d.action}</span>
+                        <span>${d.quantity} ≈ ${d.estimatedUsdt || 0} USDT</span>
+                        <span id="status-${d.symbol}" style="color:#888;">等待中...</span>
+                    </div>`).join("")}
+                </div>
+            </div>`;
+
+            try {
+                const resp = await fetch("/api/trade/execute-all", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ decisions: actionable }),
+                });
+                const data = await resp.json();
+                const results = data.results || [];
+                const summary = data.summary || {};
+
+                results.forEach(r => {
+                    const statusEl = document.getElementById(`status-${r.symbol}`);
+                    if (!statusEl) return;
+                    if (r.status === "success") {
+                        statusEl.style.color = "#00d4aa";
+                        statusEl.textContent = `✅ 成交 @ ${fmtNum(r.trade.price)} 手续费 ${fmtNum(r.trade.commission, 6)}`;
+                    } else if (r.status === "skipped") {
+                        statusEl.style.color = "#f0b90b";
+                        statusEl.textContent = `⏭ ${r.error || "跳过"}`;
+                    } else {
+                        statusEl.style.color = "#e74c3c";
+                        statusEl.textContent = `❌ ${r.error || "失败"}`;
+                    }
+                });
+
+                progressDiv.innerHTML += `
+                <div style="margin-top:16px;padding:12px;border-radius:8px;background:rgba(255,255,255,0.03);text-align:center;">
+                    <span style="color:#00d4aa;">✅ 成功: ${summary.success}</span>
+                    <span style="color:#e74c3c;margin-left:16px;">❌ 失败: ${summary.failed}</span>
+                    <span style="color:#f0b90b;margin-left:16px;">⏭ 跳过: ${summary.skipped}</span>
+                </div>`;
+
+                document.getElementById("lastUpdated").textContent = "交易于 " + nowStr();
+            } catch (err) {
+                progressDiv.innerHTML += `<div class="error-msg">${err.message}</div>`;
+            }
+
+            isExecutingAll = false;
+            await loadTradeHistory();
+            loadTradePairsInfo();
+        }
+
+        async function executeTrade(symbol, action, quantity) {
+            if (!confirm(`确认要对 ${symbol} 执行 ${action}，数量 ${quantity}？`)) return;
+            try {
+                const resp = await fetch("/api/trade/execute", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ symbol, action, quantity }),
+                });
+                const result = await resp.json();
+                if (!resp.ok) throw new Error(result.error || `HTTP ${resp.status}`);
+                const trade = result.trade || {};
+                alert(`交易成功!\n${trade.side} ${trade.symbol} ${trade.quantity} @ ${trade.price}\n交易ID: ${trade.id}`);
+                await loadTradeHistory();
+            } catch (err) {
+                alert("交易失败: " + err.message);
+            }
+            if (tradeAnalysisData) renderFullAnalysis(tradeAnalysisData);
+            if (tradeAnalysisData) renderConfirmBar(tradeAnalysisData);
+        }
+
+        async function loadTradeHistory() {
+            try {
+                const resp = await fetch("/api/trade/history");
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                const data = await resp.json();
+                const trades = data.trades || [];
+                const pnl = data.pnl || {};
+
+                if (trades.length === 0) {
+                    document.getElementById("tradeLogTable").innerHTML = '<div class="empty-msg">暂无交易记录</div>';
+                    document.getElementById("tradePnlTable").innerHTML = "";
+                    return;
+                }
+
+                const recent = trades.slice().reverse().slice(0, 100);
+                document.getElementById("tradeLogTable").innerHTML = `
+                <table class="trade-log-table">
+                    <thead><tr><th>时间</th><th>交易对</th><th>方向</th><th>数量</th><th>价格</th><th>金额(USDT)</th><th>手续费</th></tr></thead>
+                    <tbody>${recent.map(t => `
+                        <tr>
+                            <td>${t.time}</td>
+                            <td><span class="asset-name">${t.symbol}</span></td>
+                            <td><span style="color:${t.side==='BUY'?'#00d4aa':'#e74c3c'}">${t.side}</span></td>
+                            <td class="mono">${fmtNum(t.quantity)}</td>
+                            <td class="mono">${fmtNum(t.price)}</td>
+                            <td class="mono">${fmtNum(t.totalUsdt, 2)}</td>
+                            <td class="mono">${fmtNum(t.commission, 6)}</td>
+                        </tr>`).join("")}
+                    </tbody>
+                </table>`;
+
+                const bySymbol = pnl.bySymbol || {};
+                const symbols = Object.keys(bySymbol);
+                if (symbols.length === 0) {
+                    document.getElementById("tradePnlTable").innerHTML = "";
+                } else {
+                    let totalRealized = 0;
+                    let totalUnrealized = 0;
+                    document.getElementById("tradePnlTable").innerHTML = `
+                    <table class="trade-log-table">
+                        <thead><tr><th>交易对</th><th>已实现盈亏(USDT)</th><th>未实现盈亏(USDT)</th><th>总盈亏(USDT)</th></tr></thead>
+                        <tbody>${symbols.map(s => {
+                            const rp = bySymbol[s].realizedPnl || 0;
+                            const up = bySymbol[s].unrealizedPnl || 0;
+                            const tp = bySymbol[s].totalPnl || 0;
+                            totalRealized += rp;
+                            totalUnrealized += up;
+                            return `
+                            <tr>
+                                <td><span class="asset-name">${s}</span></td>
+                                <td class="mono ${rp>=0?'pnl-positive':'pnl-negative'}">${rp>=0?'+':''}${fmtNum(rp,4)}</td>
+                                <td class="mono ${up>=0?'pnl-positive':'pnl-negative'}">${up>=0?'+':''}${fmtNum(up,4)}</td>
+                                <td class="mono ${tp>=0?'pnl-positive':'pnl-negative'}">${tp>=0?'+':''}${fmtNum(tp,4)}</td>
+                            </tr>`}).join("")}
+                            <tr style="font-weight:600;border-top:1px solid rgba(255,255,255,0.1);">
+                                <td>合计</td>
+                                <td class="mono ${totalRealized>=0?'pnl-positive':'pnl-negative'}">${totalRealized>=0?'+':''}${fmtNum(totalRealized,4)}</td>
+                                <td class="mono ${totalUnrealized>=0?'pnl-positive':'pnl-negative'}">${totalUnrealized>=0?'+':''}${fmtNum(totalUnrealized,4)}</td>
+                                <td class="mono ${totalRealized+totalUnrealized>=0?'pnl-positive':'pnl-negative'}">${totalRealized+totalUnrealized>=0?'+':''}${fmtNum(totalRealized+totalUnrealized,4)}</td>
+                            </tr>
+                        </tbody>
+                    </table>`;
+                }
+            } catch (err) {
+                document.getElementById("tradeLogTable").innerHTML = `<div class="error-msg">${err.message}</div>`;
+            }
+        }
+
+        let balanceChartInstance = null;
+
+        async function fetchBalanceHistory() {
+            try {
+                const resp = await fetch("/api/balance/history");
+                if (!resp.ok) return;
+                const history = await resp.json();
+                if (!history || history.length < 2) return;
+
+                const wrap = document.getElementById("balanceChartWrap");
+                wrap.style.display = "block";
+                const canvas = document.getElementById("balanceChart");
+                canvas.width = wrap.clientWidth - 40;
+                canvas.height = 320;
+
+                if (balanceChartInstance) balanceChartInstance.destroy();
+
+                const labels = history.map(h => h.time.slice(5, 16));
+                balanceChartInstance = new Chart(canvas, {
+                    type: "line",
+                    data: {
+                        labels,
+                        datasets: [{
+                            label: "总资产 (CNY)",
+                            data: history.map(h => h.totalCny),
+                            borderColor: "#f0b90b",
+                            backgroundColor: "rgba(240,185,11,0.06)",
+                            borderWidth: 1.5,
+                            fill: true,
+                            pointRadius: 0,
+                            tension: 0.3,
+                        }],
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: {
+                            legend: { labels: { color: "#888", font: { size: 11 } } },
+                            tooltip: {
+                                backgroundColor: "rgba(20,22,30,0.95)",
+                                titleColor: "#f0b90b",
+                                bodyColor: "#e0e0e0",
+                                borderColor: "rgba(255,255,255,0.1)",
+                                borderWidth: 1,
+                            },
+                        },
+                        scales: {
+                            x: { ticks: { color: "#555", maxTicksLimit: 8, font: { size: 10 } }, grid: { color: "rgba(255,255,255,0.04)" } },
+                            y: { ticks: { color: "#555", font: { size: 10 }, callback: v => "¥" + fmtNum(v, 2) }, grid: { color: "rgba(255,255,255,0.04)" } },
+                        },
+                    },
+                });
+            } catch (e) {
+                console.error("Balance history:", e);
+            }
+        }
+
+        let manualCurrentPair = "";
+        let manualCurrentSide = "BUY";
+        let manualPairData = null;
+
+        function initManualTrade() {
+            if (allSymbols.length === 0) {
+                fetchSymbols().then(() => populateManualPairs());
+            } else {
+                populateManualPairs();
+            }
+            if (manualCurrentPair) refreshManualPair();
+        }
+
+        function populateManualPairs() {
+            const menu = document.getElementById("manualPairMenu");
+            const tradePairs = ["BTCUSDT","DOGEUSDT","ETHUSDT","BNBUSDT","SOLUSDT"];
+            const items = allSymbols.filter(s => tradePairs.includes(s.symbol)).sort((a,b) => a.symbol.localeCompare(b.symbol));
+            menu.innerHTML = items.map(s => `
+                <div class="pair-dropdown-item${s.symbol===manualCurrentPair?' selected':''}" onclick="selectManualPair('${s.symbol}')">
+                    <span>${s.symbol}</span><span style="color:#555;font-size:11px;">${s.baseAsset}/${s.quoteAsset}</span>
+                </div>
+            `).join("");
+        }
+
+        function toggleManualDropdown() {
+            document.getElementById("manualPairDropdown").classList.toggle("open");
+            if (document.getElementById("manualPairDropdown").classList.contains("open")) populateManualPairs();
+        }
+
+        async function selectManualPair(symbol) {
+            manualCurrentPair = symbol;
+            document.getElementById("manualPairLabel").textContent = symbol;
+            document.getElementById("manualPairLabel").classList.remove("placeholder");
+            document.getElementById("manualPairDropdown").classList.remove("open");
+            await refreshManualPair();
+        }
+
+        async function refreshManualPair() {
+            if (!manualCurrentPair) return;
+            const priceEl = document.getElementById("manualPrice");
+            if (priceEl) priceEl.textContent = "...";
+            let retries = 3;
+            let lastErr;
+            while (retries > 0) {
+                try {
+                    const resp = await fetch(`/api/manual/pair-info?symbol=${manualCurrentPair}`);
+                    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                    manualPairData = await resp.json();
+                    renderManualPairUI(manualPairData);
+                    document.getElementById("lastUpdated").textContent = "更新于 " + nowStr();
+                    return;
+                } catch (err) {
+                    lastErr = err;
+                    retries--;
+                    if (retries > 0) await new Promise(r => setTimeout(r, 1500));
+                }
+            }
+            if (priceEl) priceEl.textContent = "加载失败";
+            document.getElementById("manualChange").textContent = lastErr ? lastErr.message : "";
+        }
+
+        function renderManualPairUI(data) {
+            const tk = data.ticker || {};
+            document.getElementById("manualPrice").textContent = fmtNum(tk.lastPrice);
+            const change = tk.priceChangePercent || 0;
+            const c = document.getElementById("manualChange");
+            c.textContent = `${change>=0?'+':''}${change}%`;
+            c.style.color = change > 0 ? "#00d4aa" : change < 0 ? "#e74c3c" : "#888";
+
+            document.getElementById("manualBaseFree").textContent = `${fmtNum(data.balance.baseFree)} ${data.baseAsset}`;
+            document.getElementById("manualQuoteFree").textContent = `${fmtNum(data.balance.quoteFree)} ${data.quoteAsset}`;
+
+            const depth = data.depth || {bids:[],asks:[]};
+            const maxBid = depth.bids.length > 0 ? depth.bids[0][1] : 1;
+            const maxAsk = depth.asks.length > 0 ? depth.asks[depth.asks.length - 1][1] : 1;
+            const maxVol = Math.max(maxBid, maxAsk, 1);
+
+            let depthHtml = `<div style="display:flex;justify-content:space-between;color:#888;font-size:10px;margin-bottom:4px;"><span>价格(${data.quoteAsset})</span><span>数量(${data.baseAsset})</span><span>累计</span></div>`;
+            let askCum = 0;
+            const asksReversed = [...(depth.asks || [])].reverse();
+            for (const a of asksReversed) {
+                askCum += a[1];
+                const pct = Math.min((askCum / maxVol * 100), 100).toFixed(0);
+                depthHtml += `<div style="display:flex;justify-content:space-between;color:#e74c3c;font-size:12px;position:relative;padding:1px 0;overflow:hidden;">
+                    <span style="z-index:1;">${fmtNum(a[0])}</span><span style="z-index:1;">${fmtNum(a[1])}</span><span style="z-index:1;">${fmtNum(askCum)}</span>
+                    <div style="position:absolute;right:0;top:0;height:100%;width:${pct}%;min-width:${pct>0?'2px':'0'};background:rgba(231,76,60,0.1);border-radius:2px;z-index:0;"></div>
+                </div>`;
+            }
+
+            depthHtml += `<div style="text-align:center;color:#f0b90b;font-size:13px;font-weight:600;padding:4px 0;border-top:1px solid rgba(255,255,255,0.06);border-bottom:1px solid rgba(255,255,255,0.06);">${fmtNum(tk.lastPrice)}</div>`;
+
+            let bidCum = 0;
+            for (const b of (depth.bids || [])) {
+                bidCum += b[1];
+                const pct = Math.min((bidCum / maxVol * 100), 100).toFixed(0);
+                depthHtml += `<div style="display:flex;justify-content:space-between;color:#00d4aa;font-size:12px;position:relative;padding:1px 0;overflow:hidden;">
+                    <span style="z-index:1;">${fmtNum(b[0])}</span><span style="z-index:1;">${fmtNum(b[1])}</span><span style="z-index:1;">${fmtNum(bidCum)}</span>
+                    <div style="position:absolute;right:0;top:0;height:100%;width:${pct}%;min-width:${pct>0?'2px':'0'};background:rgba(0,212,170,0.1);border-radius:2px;z-index:0;"></div>
+                </div>`;
+            }
+            document.getElementById("manualDepth").innerHTML = depthHtml;
+
+            const trades = data.recentTrades || [];
+            document.getElementById("manualRecentTrades").innerHTML = `
+            <table class="trade-log-table">
+                <thead><tr><th>时间</th><th>价格</th><th>数量</th><th>方向</th></tr></thead>
+                <tbody>${trades.slice(0, 25).map(t => `
+                    <tr><td>${new Date(t.time).toLocaleTimeString("zh-CN")}</td>
+                    <td class="mono ${t.isBuyerMaker?'sell-price':''}" style="color:${t.isBuyerMaker?'#e74c3c':'#00d4aa'};">${fmtNum(t.price)}</td>
+                    <td class="mono">${fmtNum(t.qty)}</td>
+                    <td style="color:${t.isBuyerMaker?'#e74c3c':'#00d4aa'};">${t.isBuyerMaker?'卖':'买'}</td></tr>
+                `).join("")}</tbody>
+            </table>`;
+
+            updateManualEstimate();
+        }
+
+        function setManualSide(side) {
+            manualCurrentSide = side;
+            const buyBtn = document.getElementById("btnBuyMarket");
+            const sellBtn = document.getElementById("btnSellMarket");
+            const submitBtn = document.getElementById("btnSubmitOrder");
+            if (side === "BUY") {
+                buyBtn.style.opacity = "1"; sellBtn.style.opacity = "0.4";
+                submitBtn.className = "trade-btn buy";
+                submitBtn.textContent = "买入";
+            } else {
+                sellBtn.style.opacity = "1"; buyBtn.style.opacity = "0.4";
+                submitBtn.className = "trade-btn sell";
+                submitBtn.textContent = "卖出";
+            }
+            document.getElementById("btnSubmitOrder").disabled = false;
+            updateManualEstimate();
+        }
+
+        function setManualQtyPercent(pct) {
+            if (!manualPairData) return;
+            const baseFree = manualPairData.balance.baseFree || 0;
+            const quoteFree = manualPairData.balance.quoteFree || 0;
+            const price = manualPairData.ticker.lastPrice || 0;
+            let qty;
+            if (manualCurrentSide === "BUY" && price > 0) {
+                qty = (quoteFree * pct / 100) / price;
+            } else {
+                qty = baseFree * pct / 100;
+            }
+            const prec = manualPairData.precision || 4;
+            document.getElementById("manualQty").value = qty.toFixed(prec);
+            updateManualEstimate();
+        }
+
+        function updateManualEstimate() {
+            if (!manualPairData) return;
+            const qty = parseFloat(document.getElementById("manualQty").value) || 0;
+            const price = manualPairData.ticker.lastPrice || 0;
+            const est = qty * price;
+            document.getElementById("manualEstimate").textContent = `预估: ≈ ${fmtNum(est, 2)} USDT`;
+        }
+
+        async function submitManualOrder() {
+            if (!manualCurrentPair) return alert("请先选择交易对");
+            const qty = parseFloat(document.getElementById("manualQty").value);
+            if (!qty || qty <= 0) return alert("请输入数量");
+            if (!confirm(`确认 ${manualCurrentSide} ${manualCurrentPair} x ${qty}？`)) return;
+
+            document.getElementById("btnSubmitOrder").disabled = true;
+            document.getElementById("btnSubmitOrder").textContent = "提交中...";
+            try {
+                const resp = await fetch("/api/manual/order", {
+                    method: "POST",
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify({symbol: manualCurrentPair, side: manualCurrentSide, quantity: qty, orderType: "MARKET"}),
+                });
+                const result = await resp.json();
+                if (!resp.ok) throw new Error(result.error || `HTTP ${resp.status}`);
+                alert(`✅ 成交: ${result.trade.side} ${result.trade.symbol} x ${fmtNum(result.trade.quantity)} @ ${fmtNum(result.trade.price)} USDT`);
+                await refreshManualPair();
+            } catch (err) {
+                alert("交易失败: " + err.message);
+            }
+            document.getElementById("btnSubmitOrder").disabled = false;
+            document.getElementById("btnSubmitOrder").textContent = manualCurrentSide === "BUY" ? "买入" : "卖出";
+        }
+
+        document.addEventListener("click", function(e) {
+            const dd = document.getElementById("manualPairDropdown");
+            if (dd && !dd.contains(e.target)) dd.classList.remove("open");
+        });
+
+        updateDropdownLabel();
+        loadFavorites().then(() => fetchBalance());
+    </script>
+</body>
+</html>

@@ -1,0 +1,7 @@
+.env
+data/favorites.json
+data/trade_history.json
+data/positions.json
+data/balance_history.json
+__pycache__/
+*.pyc
