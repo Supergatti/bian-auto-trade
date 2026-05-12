@@ -1,23 +1,8 @@
-import json
 from flask import Blueprint, jsonify
 
-from config import TOP_HOT_PAIRS, FAVORITES_FILE, TRADE_PAIRS_FILE
-from utils.files import load_json, save_json
+from services.data_store import load_favorites, save_favorites
 
 fav_bp = Blueprint("favorites", __name__)
-
-
-def load_favorites():
-    return load_json(FAVORITES_FILE, list)
-
-
-def save_favorites(favs):
-    save_json(FAVORITES_FILE, favs)
-
-
-def load_trade_pairs():
-    pairs = load_json(TRADE_PAIRS_FILE, lambda: ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"])
-    return [p.upper().strip() for p in pairs if isinstance(p, str)]
 
 
 @fav_bp.route("/api/favorites")

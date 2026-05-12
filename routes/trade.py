@@ -1,34 +1,214 @@
 import json
 import time
-import uuid
+import threading
+import collections
 from datetime import datetime
 
 from flask import Blueprint, jsonify, request, Response, stream_with_context
 
 from config import (
-    TRADE_PAIRS_FILE, TRADE_HISTORY_FILE,
     KLINE_INTERVALS, KLINE_LIMITS, MAX_WEB_SEARCH_ROUNDS,
     DEEPSEEK_API_KEY, logger,
 )
-from routes.favorites import load_trade_pairs
+from services.data_store import (
+    load_trade_pairs, load_trade_history, save_trade_history,
+    append_trade_record, record_balance_snapshot,
+)
 from utils.files import load_json, save_json
+from utils.helpers import strip_markdown_code, parse_flash_search_response, enrich_decisions
 from services.binance import (
     collect_all_pairs_data, get_account, get_balances,
     get_symbol_filters, get_current_price, execute_order,
-    _public_request,
+    collect_pair_data, _public_request,
 )
 from services.deepseek import ask_flash, ask_pro
 from services.web_search import search_web
+from services.prompts import (
+    SEARCH_SYSTEM, SEARCH_TEMPLATE,
+    SUMMARIZE_SYSTEM, SUMMARIZE_TEMPLATE,
+    DECISION_SYSTEM, DECISION_TEMPLATE,
+)
 
 trade_bp = Blueprint("trade", __name__)
 
+# ===== Auto-Trading State =====
+_auto_state = {
+    "running": False,
+    "round": 0,
+    "last_time": None,
+    "status": "idle",
+    "interval": 600,
+    "decisions": [],
+    "last_pnl": None,
+}
+_auto_events = collections.deque(maxlen=500)
+_auto_lock = threading.Lock()
 
-def load_trade_history():
-    return load_json(TRADE_HISTORY_FILE, list)
+
+def _auto_broadcast(event_type, **kwargs):
+    evt = {"event": event_type}
+    evt.update(kwargs)
+    with _auto_lock:
+        _auto_events.append(evt)
 
 
-def save_trade_history(records):
-    save_json(TRADE_HISTORY_FILE, records)
+def _auto_trade_loop(interval):
+    global _auto_state
+    logger.info("🤖 全自动交易循环启动, 间隔 %ds", interval)
+
+    while _auto_state["running"]:
+        _auto_state["round"] += 1
+        rnd = _auto_state["round"]
+        _auto_state["status"] = f"第{rnd}轮: 数据采集中..."
+        _auto_broadcast("log", msg=f"🔄 第 {rnd} 轮自动交易开始")
+        _auto_broadcast("round_start", round=rnd, time=datetime.now().strftime("%H:%M:%S"))
+
+        try:
+            pairs = load_trade_pairs()
+            _auto_broadcast("log", msg=f"📡 采集 {len(pairs)} 个交易对市场数据...")
+
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            result = {}
+            with ThreadPoolExecutor(max_workers=5) as pool:
+                futures = {pool.submit(collect_pair_data, p): p for p in pairs}
+                for future in as_completed(futures):
+                    pair = futures[future]
+                    try:
+                        data = future.result()
+                        result[pair] = data
+                        tk = data.get("ticker", {})
+                        if isinstance(tk, dict) and "lastPrice" in tk:
+                            _auto_broadcast("collect_pair", pair=pair, price=tk["lastPrice"],
+                                          change=tk.get("priceChangePercent"))
+                    except Exception as e:
+                        _auto_broadcast("log", msg=f"  ⚠ {pair} 采集失败: {str(e)[:80]}")
+
+            market_data = {p: result[p] for p in pairs if p in result}
+
+            bal_result = get_balances()
+            bal_list = bal_result["balances"]
+            _auto_broadcast("balance", balances=[
+                {"asset": b["asset"], "total": b["total"], "cnyValue": b["cnyValue"]}
+                for b in bal_list
+            ])
+            _auto_broadcast("log", msg=f"💰 总资产约 ¥{bal_result['totalCny']:.2f}")
+
+            _auto_state["status"] = f"第{rnd}轮: AI分析中..."
+            market_summary = _make_market_summary(market_data, bal_list)
+            pairs_str = ", ".join(market_data.keys())
+
+            search_context = ""
+            for sr in range(MAX_WEB_SEARCH_ROUNDS):
+                q_prompt = SEARCH_TEMPLATE.format(market_summary=market_summary, pairs_str=pairs_str)
+                _auto_broadcast("search_round", round=sr + 1, status="asking")
+
+                try:
+                    flash_resp = ask_flash([
+                        {"role": "system", "content": SEARCH_SYSTEM},
+                        {"role": "user", "content": q_prompt},
+                    ], max_tokens=512)
+                except Exception as e:
+                    _auto_broadcast("log", msg=f"  ⚠ Flash 搜索方向失败: {str(e)[:80]}")
+                    break
+
+                searches = parse_flash_search_response(flash_resp)
+                if not searches:
+                    _auto_broadcast("search_round", round=sr + 1, status="skip", msg="DeepSeek 判断无需搜索")
+                    break
+
+                _auto_broadcast("search_query", round=sr + 1, queries=searches)
+
+                round_results = []
+                for query in searches:
+                    results = search_web(query, num_results=3)
+                    round_results.extend(results)
+                    _auto_broadcast("search_found", round=sr + 1, query=query, count=len(results))
+
+                if round_results:
+                    results_text = "\n".join(f"[{r['title']}] {r['snippet']}" for r in round_results[:10])
+                    try:
+                        summary = ask_flash([
+                            {"role": "system", "content": SUMMARIZE_SYSTEM},
+                            {"role": "user", "content": SUMMARIZE_TEMPLATE.format(results_text=results_text)},
+                        ], max_tokens=512)
+                        search_context += f"\n## 第{sr + 1}轮搜索结果\n{summary}\n"
+                        _auto_broadcast("search_summary", round=sr + 1, summary=summary)
+                    except Exception as e:
+                        _auto_broadcast("log", msg=f"  ⚠ 总结失败: {str(e)[:80]}")
+
+            _auto_broadcast("pro_start", msg="🤖 DeepSeek Pro 最终决策中...")
+            try:
+                search_section = f"## 联网搜索情报{search_context}" if search_context else ""
+                decision_prompt = DECISION_TEMPLATE.format(market_summary=market_summary, search_context=search_section)
+                content = ask_pro([
+                    {"role": "system", "content": DECISION_SYSTEM},
+                    {"role": "user", "content": decision_prompt},
+                ])
+                analysis = json.loads(strip_markdown_code(content))
+            except Exception as e:
+                _auto_broadcast("error", error=f"Pro 决策失败: {str(e)}")
+                raise
+
+            decisions = analysis.get("decisions", [])
+            enrich_decisions(decisions, market_data)
+            _auto_state["decisions"] = decisions
+            _auto_broadcast("decisions", decisions=decisions,
+                          research_summary=analysis.get("research_summary", ""),
+                          overall_analysis=analysis.get("overall_analysis", ""))
+
+            actionable = [d for d in decisions if d.get("action") in ("BUY", "SELL")
+                          and float(d.get("quantity", 0)) > 0]
+            if actionable:
+                _auto_broadcast("log", msg=f"💱 执行 {len(actionable)} 笔交易...")
+                for d in actionable:
+                    sym = d.get("symbol", "").upper().strip()
+                    act = d.get("action", "").upper().strip()
+                    qty = float(d.get("quantity", 0))
+                    try:
+                        r = _execute_one_trade(sym, act, qty)
+                        trade_info = r.get("trade", {})
+                        _auto_broadcast("trade_result", symbol=sym, action=act,
+                                      status=r.get("status", "?"),
+                                      price=trade_info.get("price", 0) if r.get("status") == "success" else 0,
+                                      quantity=trade_info.get("quantity", 0),
+                                      error=r.get("error", ""))
+                        if r.get("status") == "success":
+                            _auto_broadcast("log", msg=f"  ✅ {act} {sym} {trade_info.get('quantity', qty)} @ {trade_info.get('price', '?')}")
+                        else:
+                            _auto_broadcast("log", msg=f"  ⚠ {act} {sym}: {r.get('error', '?')}")
+                    except Exception as e:
+                        _auto_broadcast("log", msg=f"  ❌ {act} {sym}: {str(e)[:80]}")
+            else:
+                _auto_broadcast("log", msg="📊 本轮无交易建议 (全部 HOLD)")
+
+            pnl = _calculate_pnl(load_trade_history())
+            _auto_state["last_pnl"] = pnl
+            _auto_broadcast("pnl", pnl=pnl)
+
+            try:
+                record_balance_snapshot()
+            except Exception:
+                pass
+
+        except Exception as e:
+            logger.error("第 %d 轮自动交易异常: %s", rnd, str(e))
+            _auto_broadcast("error", error=f"第{rnd}轮异常: {str(e)}")
+
+        _auto_state["last_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        _auto_broadcast("round_done", round=rnd, next_round_in=interval)
+
+        _auto_state["status"] = f"等待 {interval // 60} 分钟后下一轮..."
+        wait_start = time.time()
+        while _auto_state["running"] and (time.time() - wait_start) < interval:
+            remaining = interval - int(time.time() - wait_start)
+            if remaining % 30 == 0:
+                _auto_broadcast("waiting", remaining=remaining)
+            time.sleep(1)
+
+    _auto_state["status"] = "已停止"
+    _auto_state["running"] = False
+    _auto_broadcast("auto_stopped", msg="全自动交易已停止", total_rounds=_auto_state["round"])
+    logger.info("🤖 全自动交易循环结束, 共 %d 轮", _auto_state["round"])
 
 
 def _calculate_pnl(records, specific_symbol=None):
@@ -40,6 +220,7 @@ def _calculate_pnl(records, specific_symbol=None):
     for symbol in set(r["symbol"] for r in trades):
         symbol_trades = [r for r in trades if r["symbol"] == symbol]
         buys = []
+        symbol_realized = 0
         i = 0
         while i < len(symbol_trades):
             t = symbol_trades[i]
@@ -53,8 +234,9 @@ def _calculate_pnl(records, specific_symbol=None):
                 sell_price = float(t["price"])
                 ratio = min(sell_qty / buy_qty, 1.0)
                 pnl = (sell_price - buy_price) * buy_qty * ratio - float(t.get("commission", 0))
-                total_pnl += pnl
+                symbol_realized += pnl
             i += 1
+        total_pnl += symbol_realized
         unrealized = 0
         for b in buys:
             try:
@@ -63,9 +245,9 @@ def _calculate_pnl(records, specific_symbol=None):
             except Exception:
                 pass
         pnl_by_symbol[symbol] = {
-            "realizedPnl": round(total_pnl, 4),
+            "realizedPnl": round(symbol_realized, 4),
             "unrealizedPnl": round(unrealized, 4),
-            "totalPnl": round(total_pnl + unrealized, 4),
+            "totalPnl": round(symbol_realized + unrealized, 4),
         }
     return {"bySymbol": pnl_by_symbol, "totalRealizedPnl": round(total_pnl, 4)}
 
@@ -100,47 +282,23 @@ def _make_market_summary(market_data, balances):
     return summary
 
 
-def _run_deepseek_analysis(market_data, balances):
-    market_summary = _make_market_summary(market_data, balances)
-    pairs = list(market_data.keys())
-    pairs_str = ", ".join(pairs)
-
+def _search_loop(market_summary, pairs_str):
+    """Run the web search loop with Flash. Returns accumulated search_context string."""
     search_context = ""
     for round_num in range(MAX_WEB_SEARCH_ROUNDS):
-        q_prompt = f"""你是一个加密货币交易分析师。以下是当前市场数据：
-
-{market_summary}
-
-现在你需要做交易决策。但在决策之前，你可以联网搜索以下方面的最新信息来辅助判断：
-- 这些币种的最新新闻（政策、事件、大机构动向）
-- 整体加密市场情绪和趋势
-- 任何可能影响短期价格的重要因素
-
-交易对: {pairs_str}
-
-请列出你想要搜索的内容（最多3个关键词或短语），用JSON格式返回，如果不需要搜索就直接说"不需要"。
-格式: {{"searches": ["关键词1", "关键词2", "关键词3"]}} 或 {{"searches": []}}"""
+        q_prompt = SEARCH_TEMPLATE.format(
+            market_summary=market_summary, pairs_str=pairs_str)
 
         try:
             flash_resp = ask_flash([
-                {"role": "system", "content": "你是加密货币研究助手。返回纯JSON格式回答。"},
+                {"role": "system", "content": SEARCH_SYSTEM},
                 {"role": "user", "content": q_prompt},
             ], max_tokens=512)
         except Exception as e:
             logger.warning("Flash round %d failed: %s", round_num + 1, str(e))
             break
 
-        try:
-            flash_resp = flash_resp.strip()
-            if flash_resp.startswith("```"):
-                flash_resp = flash_resp.split("\n", 1)[-1].rstrip("```").strip()
-            req = json.loads(flash_resp)
-            searches = req.get("searches", [])
-        except json.JSONDecodeError:
-            if "不需要" in flash_resp or "no need" in flash_resp.lower():
-                break
-            searches = []
-
+        searches = parse_flash_search_response(flash_resp)
         if not searches:
             break
 
@@ -153,67 +311,42 @@ def _run_deepseek_analysis(market_data, balances):
             results_text = "\n".join(
                 f"[{r['title']}] {r['snippet']}" for r in round_results[:10]
             )
-            summarize_prompt = f"""请用简洁中文总结以下搜索结果的要点（150字以内），聚焦于对加密市场的影响：
-
-{results_text}"""
-
             try:
                 summary = ask_flash([
-                    {"role": "system", "content": "你是加密货币信息摘要助手。回答简洁，不超过150字。"},
-                    {"role": "user", "content": summarize_prompt},
+                    {"role": "system", "content": SUMMARIZE_SYSTEM},
+                    {"role": "user", "content": SUMMARIZE_TEMPLATE.format(results_text=results_text)},
                 ], max_tokens=512)
                 search_context += f"\n## 第{round_num + 1}轮搜索结果\n{summary}\n"
                 logger.info("📝 Flash 总结搜索结果: %s", summary[:80])
             except Exception as e:
                 logger.warning("Flash summary failed: %s", str(e))
 
-    decision_prompt = f"""你是一个专业的加密货币量化交易分析师。请根据以下数据给出交易建议。
+    return search_context
 
-{market_summary}
 
-{f"## 联网搜索情报{search_context}" if search_context else ""}
+def _call_pro_decision(market_summary, search_context):
+    search_section = f"## 联网搜索情报{search_context}" if search_context else ""
+    decision_prompt = DECISION_TEMPLATE.format(
+        market_summary=market_summary, search_context=search_section)
 
-请对每个交易对给出以下详细分析，返回纯 JSON 格式（不要 markdown 代码块标记）：
-{{
-  "overall_analysis": "整体市场分析，200字以内",
-  "research_summary": "基于联网搜索的宏观分析摘要",
-  "decisions": [
-    {{
-      "symbol": "BTCUSDT",
-      "trend": "上升",
-      "action": "BUY",
-      "quantity": 0.001,
-      "reason": "买入理由，一句话",
-      "detail": "详细技术分析，包括支撑位阻力位、量价关系、指标信号等，100字内",
-      "estimatedUsdt": 85.50,
-      "stopLossPrice": 82000,
-      "risk": "中"
-    }}
-  ]
-}}
+    content = ask_pro([
+        {"role": "system", "content": DECISION_SYSTEM},
+        {"role": "user", "content": decision_prompt},
+    ])
+    return json.loads(strip_markdown_code(content))
 
-注意事项：
-- HOLD 时 quantity 为 0，reason 写观望理由
-- estimatedUsdt = 建议数量 × 最新价格
-- stopLossPrice 仅在 BUY/SELL 时给出建议止损价
-- 确保总买入金额不超过账户可用 USDT 余额"""
+
+def _run_deepseek_analysis(market_data, balances):
+    market_summary = _make_market_summary(market_data, balances)
+    pairs_str = ", ".join(market_data.keys())
+
+    search_context = _search_loop(market_summary, pairs_str)
 
     try:
-        content = ask_pro([
-            {"role": "system", "content": "你是一个加密货币交易分析师。始终返回纯 JSON，不要使用 markdown 代码块。"},
-            {"role": "user", "content": decision_prompt},
-        ])
+        return _call_pro_decision(market_summary, search_context)
     except Exception as e:
         logger.error("DeepSeek Pro 调用失败: %s", str(e))
         raise
-
-    content = content.strip()
-    if content.startswith("```"):
-        content = content.split("\n", 1)[-1]
-        if content.endswith("```"):
-            content = content[:-3]
-        content = content.strip()
-    return json.loads(content)
 
 
 def _execute_one_trade(symbol, action, quantity):
@@ -260,30 +393,10 @@ def _execute_one_trade(symbol, action, quantity):
     except Exception as e:
         return {"symbol": symbol, "action": action, "status": "failed", "error": str(e)}
 
-    fills = result.get("fills", [])
-    exec_price = 0; exec_qty = 0; commission = 0
-    if fills:
-        total_quote = sum(float(f["price"]) * float(f["qty"]) for f in fills)
-        exec_qty = sum(float(f["qty"]) for f in fills)
-        exec_price = total_quote / exec_qty if exec_qty > 0 else 0
-        commission = sum(float(f.get("commission", 0)) for f in fills)
-
-    trade_record = {
-        "id": str(uuid.uuid4())[:8],
-        "symbol": symbol, "side": side,
-        "quantity": exec_qty or qty,
-        "price": exec_price or current_price,
-        "commission": commission,
-        "totalUsdt": (exec_qty or qty) * (exec_price or current_price),
-        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "orderId": result.get("orderId", ""),
-    }
+    current_price = get_current_price(symbol)
+    trade_record = append_trade_record(result, current_price)
 
     logger.info("✅ 交易: %s %s %s @ %.4f USDT", trade_record["id"], side, trade_record["quantity"], trade_record["price"])
-
-    records = load_trade_history()
-    records.append(trade_record)
-    save_trade_history(records)
 
     return {"symbol": symbol, "action": action, "status": "success", "trade": trade_record}
 
@@ -305,8 +418,7 @@ def _sse(data):
 
 def _run_deepseek_analysis_stream(market_data, balances):
     market_summary = _make_market_summary(market_data, balances)
-    pairs = list(market_data.keys())
-    pairs_str = ", ".join(pairs)
+    pairs_str = ", ".join(market_data.keys())
 
     yield _sse({"event": "balance", "data": [{"asset": b["asset"], "total": b["total"], "cnyValue": b["cnyValue"]} for b in balances]})
 
@@ -314,23 +426,12 @@ def _run_deepseek_analysis_stream(market_data, balances):
     for round_num in range(MAX_WEB_SEARCH_ROUNDS):
         yield _sse({"event": "search_round", "round": round_num + 1, "status": "asking"})
 
-        q_prompt = f"""你是一个加密货币交易分析师。以下是当前市场数据：
-
-{market_summary}
-
-现在你需要做交易决策。但在决策之前，你可以联网搜索以下方面的最新信息来辅助判断：
-- 这些币种的最新新闻（政策、事件、大机构动向）
-- 整体加密市场情绪和趋势
-- 任何可能影响短期价格的重要因素
-
-交易对: {pairs_str}
-
-请列出你想要搜索的内容（最多3个关键词或短语），用JSON格式返回，如果不需要搜索就直接说"不需要"。
-格式: {{"searches": ["关键词1", "关键词2", "关键词3"]}} 或 {{"searches": []}}"""
+        q_prompt = SEARCH_TEMPLATE.format(
+            market_summary=market_summary, pairs_str=pairs_str)
 
         try:
             flash_resp = ask_flash([
-                {"role": "system", "content": "你是加密货币研究助手。返回纯JSON格式回答。"},
+                {"role": "system", "content": SEARCH_SYSTEM},
                 {"role": "user", "content": q_prompt},
             ], max_tokens=512)
         except Exception as e:
@@ -338,18 +439,10 @@ def _run_deepseek_analysis_stream(market_data, balances):
             yield _sse({"event": "search_error", "round": round_num + 1, "error": str(e)[:100]})
             break
 
-        try:
-            flash_resp = flash_resp.strip()
-            if flash_resp.startswith("```"):
-                flash_resp = flash_resp.split("\n", 1)[-1].rstrip("```").strip()
-            req = json.loads(flash_resp)
-            searches = req.get("searches", [])
-        except json.JSONDecodeError:
-            if "不需要" in flash_resp or "no need" in flash_resp.lower():
-                yield _sse({"event": "search_round", "round": round_num + 1, "status": "skip", "msg": "DeepSeek 判断无需额外搜索"})
-                break
-            searches = []
-
+        searches = parse_flash_search_response(flash_resp)
+        if "不需要" in flash_resp or "no need" in flash_resp.lower():
+            yield _sse({"event": "search_round", "round": round_num + 1, "status": "skip", "msg": "DeepSeek 判断无需额外搜索"})
+            break
         if not searches:
             yield _sse({"event": "search_round", "round": round_num + 1, "status": "skip", "msg": "无搜索关键词"})
             break
@@ -371,8 +464,8 @@ def _run_deepseek_analysis_stream(market_data, balances):
 
             try:
                 summary = ask_flash([
-                    {"role": "system", "content": "你是加密货币信息摘要助手。回答简洁，不超过150字。"},
-                    {"role": "user", "content": f"请用简洁中文总结以下搜索结果要点（150字内），聚焦加密市场影响：\n\n{results_text}"},
+                    {"role": "system", "content": SUMMARIZE_SYSTEM},
+                    {"role": "user", "content": SUMMARIZE_TEMPLATE.format(results_text=results_text)},
                 ], max_tokens=512)
                 search_context += f"\n## 第{round_num + 1}轮搜索结果\n{summary}\n"
                 yield _sse({"event": "search_summary", "round": round_num + 1, "summary": summary})
@@ -384,75 +477,28 @@ def _run_deepseek_analysis_stream(market_data, balances):
 
     yield _sse({"event": "pro_start", "msg": "发送完整数据到 DeepSeek-V4-Pro 进行最终决策..."})
 
-    decision_prompt = f"""你是一个专业的加密货币量化交易分析师。请根据以下数据给出交易建议。
-
-{market_summary}
-
-{f"## 联网搜索情报{search_context}" if search_context else ""}
-
-请对每个交易对给出以下详细分析，返回纯 JSON 格式（不要 markdown 代码块标记）：
-{{
-  "overall_analysis": "整体市场分析，200字以内",
-  "research_summary": "基于联网搜索的宏观分析摘要",
-  "decisions": [
-    {{
-      "symbol": "BTCUSDT",
-      "trend": "上升",
-      "action": "BUY",
-      "quantity": 0.001,
-      "reason": "买入理由，一句话",
-      "detail": "详细技术分析，包括支撑位阻力位、量价关系、指标信号等，100字内",
-      "estimatedUsdt": 85.50,
-      "stopLossPrice": 82000,
-      "risk": "中"
-    }}
-  ]
-}}
-
-注意事项：
-- HOLD 时 quantity 为 0，reason 写观望理由
-- estimatedUsdt = 建议数量 × 最新价格
-- stopLossPrice 仅在 BUY/SELL 时给出建议止损价
-- 确保总买入金额不超过账户可用 USDT 余额"""
-
     try:
+        search_section = f"## 联网搜索情报{search_context}" if search_context else ""
+        decision_prompt = DECISION_TEMPLATE.format(
+            market_summary=market_summary, search_context=search_section)
         content = ask_pro([
-            {"role": "system", "content": "你是一个加密货币交易分析师。始终返回纯 JSON，不要使用 markdown 代码块。"},
+            {"role": "system", "content": DECISION_SYSTEM},
             {"role": "user", "content": decision_prompt},
         ])
         yield _sse({"event": "pro_done", "length": len(content)})
+        analysis = json.loads(strip_markdown_code(content))
+    except json.JSONDecodeError as e:
+        yield _sse({"event": "error", "error": f"JSON 解析失败: {str(e)}"})
+        return
     except Exception as e:
         logger.error("DeepSeek Pro 调用失败: %s", str(e))
         yield _sse({"event": "error", "error": f"DeepSeek Pro 决策失败: {str(e)}"})
         return
 
-    content = content.strip()
-    if content.startswith("```"):
-        content = content.split("\n", 1)[-1]
-        if content.endswith("```"):
-            content = content[:-3]
-        content = content.strip()
-
-    try:
-        analysis = json.loads(content)
-    except json.JSONDecodeError as e:
-        yield _sse({"event": "error", "error": f"JSON 解析失败: {str(e)}"})
-        return
-
     decisions = analysis.get("decisions", [])
-    for d in decisions:
-        sym = d.get("symbol", "")
-        if sym in market_data and "ticker" in market_data[sym]:
-            tk = market_data[sym]["ticker"]
-            if "error" not in tk:
-                if "estimatedUsdt" not in d:
-                    d["estimatedUsdt"] = round(float(d.get("quantity", 0)) * tk["lastPrice"], 2)
-                    d["lastPrice"] = tk["lastPrice"]
-        d.setdefault("detail", d.get("reason", ""))
-        d.setdefault("stopLossPrice", None)
+    enrich_decisions(decisions, market_data)
 
     yield _sse({"event": "decisions", "decisions": decisions, "research_summary": analysis.get("research_summary", ""), "overall_analysis": analysis.get("overall_analysis", "")})
-
     yield _sse({"event": "done", "marketData": market_data, "analysis": analysis})
 
 
@@ -551,15 +597,7 @@ def trade_analyze():
         return jsonify({"error": f"DeepSeek 分析失败: {str(e)}"}), 500
 
     decisions = analysis.get("decisions", [])
-    for d in decisions:
-        sym = d.get("symbol", "")
-        if sym in market_data and "ticker" in market_data[sym]:
-            tk = market_data[sym]["ticker"]
-            if "error" not in tk and "estimatedUsdt" not in d:
-                d["estimatedUsdt"] = round(float(d.get("quantity", 0)) * tk["lastPrice"], 2)
-                d["lastPrice"] = tk["lastPrice"]
-        d.setdefault("detail", d.get("reason", ""))
-        d.setdefault("stopLossPrice", None)
+    enrich_decisions(decisions, market_data)
 
     logger.info("📊 分析结果: %d 个决策", len(decisions))
     for d in decisions:
@@ -660,3 +698,81 @@ def positions():
                 "unrealizedPnl": round((cp - avg_cost) * h["quantity"], 4) if avg_cost > 0 else 0,
             })
     return jsonify(result)
+
+
+# ===== Auto-Trading Endpoints =====
+
+@trade_bp.route("/api/trade/auto-start", methods=["POST"])
+def auto_trade_start():
+    if _auto_state["running"]:
+        return jsonify({"error": "自动交易已在运行中"}), 400
+    if not DEEPSEEK_API_KEY:
+        return jsonify({"error": "请设置 DEEPSEEK_API_KEY"}), 400
+
+    data = request.get_json(silent=True) or {}
+    interval = int(data.get("interval", 600))
+    interval = max(60, min(interval, 86400))
+
+    _auto_state["running"] = True
+    _auto_state["round"] = 0
+    _auto_state["status"] = "启动中"
+    _auto_state["interval"] = interval
+    _auto_state["decisions"] = []
+    _auto_state["last_pnl"] = None
+    _auto_state["last_time"] = None
+
+    with _auto_lock:
+        _auto_events.clear()
+
+    _auto_broadcast("auto_started", interval=interval)
+    logger.info("🚀 全自动交易启动, 间隔 %ds", interval)
+
+    thread = threading.Thread(target=_auto_trade_loop, args=(interval,), daemon=True)
+    thread.start()
+    _auto_state["thread"] = thread
+
+    return jsonify({"status": "started", "interval": interval})
+
+
+@trade_bp.route("/api/trade/auto-stop", methods=["POST"])
+def auto_trade_stop():
+    if not _auto_state["running"]:
+        return jsonify({"error": "自动交易未在运行"}), 400
+    _auto_state["running"] = False
+    _auto_state["status"] = "stopping"
+    _auto_broadcast("auto_stopping", msg="正在停止...")
+    logger.info("🛑 全自动交易停止信号已发送")
+    return jsonify({"status": "stopping"})
+
+
+@trade_bp.route("/api/trade/auto-status")
+def auto_trade_status():
+    return jsonify({
+        "running": _auto_state["running"],
+        "round": _auto_state["round"],
+        "lastTime": _auto_state["last_time"],
+        "status": _auto_state["status"],
+        "interval": _auto_state["interval"],
+        "decisions": _auto_state["decisions"],
+        "pnl": _auto_state.get("last_pnl"),
+    })
+
+
+@trade_bp.route("/api/trade/auto-stream")
+def auto_trade_stream():
+    def generate():
+        idx = 0
+        while True:
+            with _auto_lock:
+                new_events = list(_auto_events)[idx:]
+                idx = len(_auto_events)
+            for evt in new_events:
+                yield (json.dumps(evt, ensure_ascii=False, default=str) + "\n").encode()
+            if not _auto_state["running"] and idx > 0:
+                break
+            time.sleep(1)
+    return Response(
+        stream_with_context(generate()),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )

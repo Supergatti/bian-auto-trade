@@ -1,7 +1,7 @@
 from flask import Blueprint, jsonify
 
 from services.binance import check_keys, get_account, get_balances, get_trading_symbols, get_klines
-from routes.favorites import load_favorites, save_favorites
+from services.data_store import load_favorites, save_favorites, record_balance_snapshot
 from config import TOP_HOT_PAIRS
 
 account_bp = Blueprint("account", __name__)
@@ -41,8 +41,7 @@ def balance():
         if added:
             save_favorites(favs)
 
-        from routes.manual_trade import _record_balance_snapshot
-        _record_balance_snapshot()
+        record_balance_snapshot()
 
         return jsonify(data)
     except Exception as e:

@@ -1,13 +1,14 @@
 import time
-import uuid
 from datetime import datetime
 
 import requests
 from flask import Blueprint, jsonify, request
 
-from config import BALANCE_HISTORY_FILE, logger
-from routes.favorites import load_trade_pairs
-from utils.files import load_json, save_json
+from config import logger
+from services.data_store import (
+    load_trade_pairs, load_trade_history, save_trade_history,
+    _load_balance_history, record_balance_snapshot, append_trade_record,
+)
 from services.binance import (
     check_keys, get_account, get_balances,
     get_depth, get_recent_trades, get_ticker_24h,
@@ -15,37 +16,6 @@ from services.binance import (
 )
 
 manual_bp = Blueprint("manual", __name__)
-
-
-def _load_balance_history():
-    return load_json(BALANCE_HISTORY_FILE, list)
-
-
-def _save_balance_history(records):
-    max_entries = 1000
-    if len(records) > max_entries:
-        records = records[-max_entries:]
-    save_json(BALANCE_HISTORY_FILE, records)
-
-
-def _record_balance_snapshot():
-    try:
-        data = get_balances()
-        total_cny = data.get("totalCny", 0)
-        history = _load_balance_history()
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        if history and history[-1]["time"] == now:
-            history[-1] = {"time": now, "totalCny": total_cny}
-        else:
-            history.append({"time": now, "totalCny": total_cny})
-            if len(history) > 1:
-                prev_time = datetime.strptime(history[-2]["time"], "%Y-%m-%d %H:%M:%S")
-                curr_time = datetime.strptime(now, "%Y-%m-%d %H:%M:%S")
-                if (curr_time - prev_time).total_seconds() < 600:
-                    history.pop(-2)
-        _save_balance_history(history)
-    except Exception as e:
-        logger.warning("记录余额快照失败: %s", str(e)[:80])
 
 
 @manual_bp.route("/api/balance/history")
@@ -151,30 +121,7 @@ def manual_order():
 
         params = {"symbol": symbol, "side": side, "type": order_type, "quantity": qty}
         result = execute_order(symbol, side, qty)
-
-        fills = result.get("fills", [])
-        exec_price = 0; exec_qty = 0; commission = 0
-        if fills:
-            total_quote = sum(float(f["price"]) * float(f["qty"]) for f in fills)
-            exec_qty = sum(float(f["qty"]) for f in fills)
-            exec_price = total_quote / exec_qty if exec_qty > 0 else 0
-            commission = sum(float(f.get("commission", 0)) for f in fills)
-
-        trade_record = {
-            "id": str(uuid.uuid4())[:8],
-            "symbol": symbol, "side": side,
-            "quantity": exec_qty or qty,
-            "price": exec_price or get_current_price(symbol),
-            "totalUsdt": (exec_qty or qty) * (exec_price or get_current_price(symbol)),
-            "commission": commission,
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "orderId": result.get("orderId", ""),
-        }
-
-        from routes.trade import load_trade_history, save_trade_history
-        records = load_trade_history()
-        records.append(trade_record)
-        save_trade_history(records)
+        trade_record = append_trade_record(result, get_current_price(symbol))
 
         logger.info("💱 手动交易: %s %s %s @ %.4f", symbol, side, trade_record["quantity"], trade_record["price"])
 
