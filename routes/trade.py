@@ -659,6 +659,64 @@ def _execute_one_trade(symbol, action, quantity):
     return {"symbol": symbol, "action": action, "status": "success", "trade": trade_record}
 
 
+def _execute_margin_short(symbol, quantity):
+    """Borrow asset, sell it on margin (open short position)."""
+    base_asset = symbol.replace("USDT", "")
+    try:
+        # 1. Check max borrowable
+        max_borrow = margin_max_borrowable(base_asset)
+        borrow_qty = min(float(quantity), max_borrow * 0.9)
+        if borrow_qty <= 0:
+            return {"status": "failed", "error": f"{base_asset} 无可借额度 (max={max_borrow})"}
+
+        # 2. Borrow
+        logger.info("📌 借币 %s x %s", base_asset, borrow_qty)
+        margin_borrow(base_asset, borrow_qty)
+
+        # 3. Sell on margin
+        result = margin_order(symbol, "SELL", borrow_qty)
+        current_price = get_current_price(symbol)
+        trade_record = append_trade_record(result, current_price)
+
+        logger.info("✅ 做空: SELL %s x %s @ %.4f", symbol, borrow_qty, current_price)
+        return {"status": "success", "trade": trade_record, "borrowed": borrow_qty, "mode": "margin_short"}
+    except Exception as e:
+        return {"status": "failed", "error": f"做空失败: {str(e)}"}
+
+
+def _execute_margin_cover(symbol, quantity, base_asset=None):
+    """Buy back asset and repay loan (close short position)."""
+    if not base_asset:
+        base_asset = symbol.replace("USDT", "")
+    try:
+        # 1. Get borrowed amount from margin account
+        try:
+            acct = margin_account()
+            borrowed = 0
+            for b in acct.get("userAssets", []):
+                if b["asset"] == base_asset:
+                    borrowed = float(b.get("borrowed", 0))
+                    break
+        except Exception:
+            borrowed = float(quantity)
+
+        buy_qty = min(float(quantity), borrowed) if borrowed > 0 else float(quantity)
+        if buy_qty <= 0:
+            return {"status": "failed", "error": f"{base_asset} 无借币可还"}
+
+        # 2. Buy back
+        result = margin_order(symbol, "BUY", buy_qty)
+        current_price = get_current_price(symbol)
+        trade_record = append_trade_record(result, current_price)
+
+        # 3. Repay
+        margin_repay(base_asset, buy_qty)
+        logger.info("✅ 平空: BUY %s x %s @ %.4f + 还款", symbol, buy_qty, current_price)
+        return {"status": "success", "trade": trade_record, "repaid": buy_qty, "mode": "margin_cover"}
+    except Exception as e:
+        return {"status": "failed", "error": f"平空失败: {str(e)}"}
+
+
 @trade_bp.route("/api/trade/pairs")
 def trade_pairs():
     return jsonify(load_trade_pairs())
