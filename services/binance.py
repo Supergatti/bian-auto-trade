@@ -143,6 +143,39 @@ def execute_order(symbol, side, quantity):
     return _signed_request("POST", "/api/v3/order", params)
 
 
+# ===== Margin Trading (Short Selling) =====
+
+def margin_account():
+    """Get cross margin account details (borrowed, free, net asset, etc.)."""
+    return _signed_request("GET", "/sapi/v1/margin/account")
+
+
+def margin_max_borrowable(asset):
+    """Get max borrowable amount for an asset in cross margin."""
+    data = _signed_request("GET", "/sapi/v1/margin/maxBorrowable", {"asset": asset})
+    return float(data.get("amount", 0))
+
+
+def margin_borrow(asset, amount):
+    """Borrow an asset on cross margin."""
+    return _signed_request("POST", "/sapi/v1/margin/loan", {
+        "asset": asset, "amount": str(amount),
+    })
+
+
+def margin_repay(asset, amount):
+    """Repay a borrowed asset on cross margin."""
+    return _signed_request("POST", "/sapi/v1/margin/repay", {
+        "asset": asset, "amount": str(amount),
+    })
+
+
+def margin_order(symbol, side, quantity):
+    """Place a margin trade order (side=SELL to short, side=BUY to cover)."""
+    params = {"symbol": symbol, "side": side, "type": "MARKET", "quantity": str(quantity)}
+    return _signed_request("POST", "/sapi/v1/margin/order", params)
+
+
 def get_depth(symbol, limit=10):
     data = _public_request("/api/v3/depth", {"symbol": symbol.upper(), "limit": limit})
     return {

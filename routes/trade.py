@@ -3,6 +3,7 @@ import time
 import threading
 import collections
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from flask import Blueprint, jsonify, request, Response, stream_with_context
 
@@ -20,6 +21,7 @@ from services.binance import (
     collect_all_pairs_data, get_account, get_balances,
     get_symbol_filters, get_current_price, execute_order,
     collect_pair_data, _public_request,
+    margin_account, margin_max_borrowable, margin_borrow, margin_repay, margin_order,
 )
 from services.deepseek import ask_flash, ask_pro
 from services.web_search import search_web
@@ -27,9 +29,16 @@ from services.prompts import (
     SEARCH_SYSTEM, SEARCH_TEMPLATE,
     SUMMARIZE_SYSTEM, SUMMARIZE_TEMPLATE,
     DECISION_SYSTEM, DECISION_TEMPLATE,
+    FLASH_DECISION_SYSTEM, FLASH_DECISION_TEMPLATE,
 )
 
 trade_bp = Blueprint("trade", __name__)
+
+# Escalate to Pro when Flash suggests a trade above this USD threshold
+ESCALATE_USDT_THRESHOLD = 100
+# Keywords that trigger Pro escalation regardless of trade size
+ESCALATE_KEYWORDS = ["crash", "暴跌", "崩盘", "hack", "黑客", "regulation", "监管",
+                     "ban", "禁止", "delist", "下架", "sec", "lawsuit", "诉讼"]
 
 # ===== Auto-Trading State =====
 _auto_state = {
@@ -38,8 +47,12 @@ _auto_state = {
     "last_time": None,
     "status": "idle",
     "interval": 600,
+    "search_interval": 7200,
+    "last_search_time": 0,
+    "cached_search_context": "",
     "decisions": [],
     "last_pnl": None,
+    "positions": {},
 }
 _auto_events = collections.deque(maxlen=500)
 _auto_lock = threading.Lock()
@@ -52,22 +65,199 @@ def _auto_broadcast(event_type, **kwargs):
         _auto_events.append(evt)
 
 
+def _check_positions(market_data):
+    """Check tracked positions for stop-loss, take-profit, and flash-crash triggers.
+    Returns list of exit trades executed."""
+    exits = []
+    positions = _auto_state.get("positions", {})
+    if not positions:
+        return exits
+
+    for symbol, pos in list(positions.items()):
+        try:
+            current_price = get_current_price(symbol)
+        except Exception:
+            continue
+
+        entry = pos.get("entry_price", 0)
+        qty = pos.get("quantity", 0)
+        sl = pos.get("stop_loss", 0)
+        tp = pos.get("take_profit", 0)
+
+        if entry <= 0 or qty <= 0:
+            continue
+
+        pnl_pct = (current_price - entry) / entry * 100
+        reason = None
+
+        # 1. Stop-loss hit
+        if sl > 0 and current_price <= sl:
+            reason = f"🛑 止损触发: 当前价 {current_price} <= 止损价 {sl} (亏损 {pnl_pct:.1f}%)"
+
+        # 2. Take-profit hit
+        elif tp > 0 and current_price >= tp:
+            reason = f"🎯 止盈触发: 当前价 {current_price} >= 止盈价 {tp} (盈利 {pnl_pct:.1f}%)"
+
+        # 3. Flash crash: >5% drop from entry in a short period
+        elif pnl_pct <= -5:
+            reason = f"⚠ 风控平仓: 跌幅 {pnl_pct:.1f}% 超过 5% 阈值"
+
+        if reason:
+            logger.info(reason)
+            _auto_broadcast("log", msg=reason)
+            try:
+                r = _execute_one_trade(symbol, "SELL", qty)
+                trade_info = r.get("trade", {})
+                if r.get("status") == "success":
+                    _auto_broadcast("log", msg=f"  ✅ 自动平仓 {symbol} x {qty} @ {current_price}")
+                    _auto_broadcast("trade_result", symbol=symbol, action="SELL",
+                                  status="success", price=current_price, quantity=qty,
+                                  error=f"自动: {reason}")
+                    exits.append({"symbol": symbol, "action": "SELL", "qty": qty, "price": current_price, "reason": reason})
+                    del _auto_state["positions"][symbol]
+                else:
+                    _auto_broadcast("log", msg=f"  ❌ 自动平仓失败 {symbol}: {r.get('error', '?')}")
+            except Exception as e:
+                _auto_broadcast("log", msg=f"  ❌ 自动平仓异常 {symbol}: {str(e)[:80]}")
+                logger.error("自动平仓异常 %s: %s", symbol, str(e))
+
+    return exits
+
+
+def _do_full_search(market_summary, pairs_str):
+    """Single-round search: Flash suggests queries → parallel Tavily → one summary.
+    LLM calls: 2 (direction + summary). Tavily calls: up to 5 (parallel)."""
+    search_context = ""
+
+    # Step 1: Flash suggests what to search (1 LLM call)
+    q_prompt = SEARCH_TEMPLATE.format(market_summary=market_summary, pairs_str=pairs_str)
+    _auto_broadcast("search_round", round=1, status="asking")
+
+    try:
+        flash_resp = ask_flash([
+            {"role": "system", "content": SEARCH_SYSTEM},
+            {"role": "user", "content": q_prompt},
+        ], max_tokens=512)
+    except Exception as e:
+        _auto_broadcast("log", msg=f"⚠ Flash 搜索方向失败: {str(e)[:80]}")
+        return search_context
+
+    searches = parse_flash_search_response(flash_resp)
+    if not searches:
+        _auto_broadcast("log", msg="📋 Flash 判断无需搜索")
+        return search_context
+
+    _auto_broadcast("search_query", round=1, queries=searches)
+
+    # Step 2: Parallel Tavily searches (up to 5, all at once)
+    all_results = []
+    with ThreadPoolExecutor(max_workers=min(len(searches), 5)) as pool:
+        futures = {pool.submit(search_web, q, 4): q for q in searches[:5]}
+        for future in as_completed(futures):
+            query = futures[future]
+            try:
+                results = future.result()
+                all_results.extend(results)
+                _auto_broadcast("search_found", round=1, query=query, count=len(results))
+            except Exception as e:
+                _auto_broadcast("log", msg=f"  ⚠ 搜索 '{query[:30]}' 失败: {str(e)[:60]}")
+
+    if not all_results:
+        _auto_broadcast("log", msg="📋 所有搜索无结果")
+        return search_context
+
+    # Step 3: Flash summarizes all results in one go (1 LLM call)
+    results_text = "\n---\n".join(
+        f"[{r['title']}] {r['snippet']}" for r in all_results[:15]
+    )
+    try:
+        summary = ask_flash([
+            {"role": "system", "content": SUMMARIZE_SYSTEM},
+            {"role": "user", "content": SUMMARIZE_TEMPLATE.format(results_text=results_text)},
+        ], max_tokens=512)
+        search_context = f"\n{summary}\n"
+        _auto_broadcast("search_summary", round=1, summary=summary)
+    except Exception as e:
+        _auto_broadcast("log", msg=f"⚠ 总结失败: {str(e)[:80]}")
+
+    return search_context
+
+
+def _call_flash_decision(market_summary, search_context, positions_block):
+    """Call DeepSeek Flash for a quick trading decision."""
+    search_section = f"## 联网搜索情报{search_context}" if search_context else "## 联网搜索情报\n(暂无搜索数据)"
+    prompt = FLASH_DECISION_TEMPLATE.format(
+        market_summary=market_summary,
+        search_context=search_section,
+        open_positions=positions_block,
+    )
+    content = ask_flash([
+        {"role": "system", "content": FLASH_DECISION_SYSTEM},
+        {"role": "user", "content": prompt},
+    ], max_tokens=1024)
+    return json.loads(strip_markdown_code(content))
+
+
+def _should_escalate_to_pro(flash_analysis):
+    """Check if Flash's decisions warrant escalation to Pro."""
+    decisions = flash_analysis.get("decisions", [])
+    search_context = _auto_state.get("cached_search_context", "")
+
+    # Check search context for alarming keywords
+    ctx_lower = search_context.lower()
+    for kw in ESCALATE_KEYWORDS:
+        if kw.lower() in ctx_lower:
+            logger.info("⚠ 搜索情报含关键词 '%s', 升级到 Pro", kw)
+            return True
+
+    for d in decisions:
+        action = d.get("action", "HOLD")
+        est = float(d.get("estimatedUsdt", 0))
+
+        # SELL decision → escalate
+        if action == "SELL" and est > 0:
+            logger.info("⚠ Flash 建议卖出 %s ≈$%.2f, 升级到 Pro", d.get("symbol"), est)
+            return True
+
+        # BUY above threshold → escalate
+        if action == "BUY" and est > ESCALATE_USDT_THRESHOLD:
+            logger.info("⚠ Flash 建议买入 %s ≈$%.2f > $%d, 升级到 Pro", d.get("symbol"), est, ESCALATE_USDT_THRESHOLD)
+            return True
+
+    return False
+
+
+def _call_pro_decision_wrapper(market_summary, search_context, positions_block):
+    """Call DeepSeek Pro for a final trading decision (same signature as _call_flash_decision)."""
+    search_section = f"## 联网搜索情报{search_context}" if search_context else "## 联网搜索情报\n(暂无搜索数据)"
+    prompt = DECISION_TEMPLATE.format(
+        market_summary=market_summary,
+        search_context=search_section,
+        open_positions=positions_block,
+    )
+    content = ask_pro([
+        {"role": "system", "content": DECISION_SYSTEM},
+        {"role": "user", "content": prompt},
+    ])
+    return json.loads(strip_markdown_code(content))
+
+
 def _auto_trade_loop(interval):
     global _auto_state
-    logger.info("🤖 全自动交易循环启动, 间隔 %ds", interval)
+    logger.info("🤖 全自动交易循环启动, 间隔 %ds (搜索间隔 %ds)", interval, _auto_state["search_interval"])
 
     while _auto_state["running"]:
         _auto_state["round"] += 1
         rnd = _auto_state["round"]
-        _auto_state["status"] = f"第{rnd}轮: 数据采集中..."
+        _auto_state["status"] = f"第{rnd}轮: 采集数据..."
         _auto_broadcast("log", msg=f"🔄 第 {rnd} 轮自动交易开始")
         _auto_broadcast("round_start", round=rnd, time=datetime.now().strftime("%H:%M:%S"))
 
         try:
+            # ===== Step 0: Collect market data =====
             pairs = load_trade_pairs()
             _auto_broadcast("log", msg=f"📡 采集 {len(pairs)} 个交易对市场数据...")
 
-            from concurrent.futures import ThreadPoolExecutor, as_completed
             result = {}
             with ThreadPoolExecutor(max_workers=5) as pool:
                 futures = {pool.submit(collect_pair_data, p): p for p in pairs}
@@ -85,6 +275,26 @@ def _auto_trade_loop(interval):
 
             market_data = {p: result[p] for p in pairs if p in result}
 
+            # ===== Step 1: Check positions for stop-loss / take-profit / volatility =====
+            positions = _auto_state.get("positions", {})
+            if positions:
+                _auto_broadcast("log", msg=f"🔍 检查 {len(positions)} 个持仓: {', '.join(positions.keys())}")
+                exits = _check_positions(market_data)
+                if exits:
+                    _auto_broadcast("log", msg=f"💥 {len(exits)} 个持仓触发自动平仓")
+                    pnl = _calculate_pnl(load_trade_history())
+                    _auto_state["last_pnl"] = pnl
+                    _auto_broadcast("pnl", pnl=pnl)
+                    try:
+                        record_balance_snapshot()
+                    except Exception:
+                        pass
+                remaining = _auto_state.get("positions", {})
+                if remaining:
+                    pos_list = ", ".join(f"{s}(入场{pos['entry_price']})" for s, pos in remaining.items())
+                    _auto_broadcast("log", msg=f"📌 剩余持仓: {pos_list}")
+
+            # ===== Step 2: Get balances =====
             bal_result = get_balances()
             bal_list = bal_result["balances"]
             _auto_broadcast("balance", balances=[
@@ -93,69 +303,81 @@ def _auto_trade_loop(interval):
             ])
             _auto_broadcast("log", msg=f"💰 总资产约 ¥{bal_result['totalCny']:.2f}")
 
-            _auto_state["status"] = f"第{rnd}轮: AI分析中..."
+            # ===== Step 3: Search (only every 2 hours) =====
             market_summary = _make_market_summary(market_data, bal_list)
             pairs_str = ", ".join(market_data.keys())
 
-            search_context = ""
-            for sr in range(MAX_WEB_SEARCH_ROUNDS):
-                q_prompt = SEARCH_TEMPLATE.format(market_summary=market_summary, pairs_str=pairs_str)
-                _auto_broadcast("search_round", round=sr + 1, status="asking")
+            now_ts = time.time()
+            search_interval = _auto_state.get("search_interval", 7200)
+            last_search = _auto_state.get("last_search_time", 0)
+            need_search = (now_ts - last_search) >= search_interval
 
-                try:
-                    flash_resp = ask_flash([
-                        {"role": "system", "content": SEARCH_SYSTEM},
-                        {"role": "user", "content": q_prompt},
-                    ], max_tokens=512)
-                except Exception as e:
-                    _auto_broadcast("log", msg=f"  ⚠ Flash 搜索方向失败: {str(e)[:80]}")
-                    break
+            if need_search:
+                _auto_state["status"] = f"第{rnd}轮: 联网搜索中..."
+                _auto_broadcast("log", msg="🌐 触发联网搜索 (距上次搜索超过2小时)")
+                search_context = _do_full_search(market_summary, pairs_str)
+                _auto_state["last_search_time"] = now_ts
+                _auto_state["cached_search_context"] = search_context
+            else:
+                search_context = _auto_state.get("cached_search_context", "")
+                since = int((now_ts - last_search) // 60)
+                _auto_broadcast("log", msg=f"📋 使用缓存搜索情报 (上次搜索 {since} 分钟前)")
+                if search_context:
+                    _auto_broadcast("log", msg=f"📋 缓存内容: {search_context[:120]}...")
 
-                searches = parse_flash_search_response(flash_resp)
-                if not searches:
-                    _auto_broadcast("search_round", round=sr + 1, status="skip", msg="DeepSeek 判断无需搜索")
-                    break
-
-                _auto_broadcast("search_query", round=sr + 1, queries=searches)
-
-                round_results = []
-                for query in searches:
-                    results = search_web(query, num_results=3)
-                    round_results.extend(results)
-                    _auto_broadcast("search_found", round=sr + 1, query=query, count=len(results))
-
-                if round_results:
-                    results_text = "\n".join(f"[{r['title']}] {r['snippet']}" for r in round_results[:10])
+            # ===== Step 4: Build open positions summary for Pro =====
+            positions_block = ""
+            current_positions = _auto_state.get("positions", {})
+            if current_positions:
+                positions_block = "## 当前持仓\n"
+                for sym, pos in current_positions.items():
                     try:
-                        summary = ask_flash([
-                            {"role": "system", "content": SUMMARIZE_SYSTEM},
-                            {"role": "user", "content": SUMMARIZE_TEMPLATE.format(results_text=results_text)},
-                        ], max_tokens=512)
-                        search_context += f"\n## 第{sr + 1}轮搜索结果\n{summary}\n"
-                        _auto_broadcast("search_summary", round=sr + 1, summary=summary)
-                    except Exception as e:
-                        _auto_broadcast("log", msg=f"  ⚠ 总结失败: {str(e)[:80]}")
+                        cp = get_current_price(sym)
+                        pnl_pct = (cp - pos["entry_price"]) / pos["entry_price"] * 100
+                    except Exception:
+                        cp = 0
+                        pnl_pct = 0
+                    positions_block += (
+                        f"- {sym}: 入场价 {pos['entry_price']} 数量 {pos['quantity']} "
+                        f"止损 {pos.get('stop_loss', '-')} 止盈 {pos.get('take_profit', '-')} "
+                        f"当前 {cp} (盈亏 {pnl_pct:+.1f}%)\n"
+                    )
+            else:
+                positions_block = "## 当前持仓\n(空仓，无持仓)"
 
-            _auto_broadcast("pro_start", msg="🤖 DeepSeek Pro 最终决策中...")
+            # ===== Step 5: AI decision (Flash first, Pro on escalation) =====
+            _auto_state["status"] = f"第{rnd}轮: Flash 快速分析..."
+            _auto_broadcast("log", msg="🧠 Flash 快速决策中...")
+            used_model = "flash"
+
             try:
-                search_section = f"## 联网搜索情报{search_context}" if search_context else ""
-                decision_prompt = DECISION_TEMPLATE.format(market_summary=market_summary, search_context=search_section)
-                content = ask_pro([
-                    {"role": "system", "content": DECISION_SYSTEM},
-                    {"role": "user", "content": decision_prompt},
-                ])
-                analysis = json.loads(strip_markdown_code(content))
+                analysis = _call_flash_decision(market_summary, search_context, positions_block)
             except Exception as e:
-                _auto_broadcast("error", error=f"Pro 决策失败: {str(e)}")
+                _auto_broadcast("error", error=f"Flash 决策失败: {str(e)}")
                 raise
+
+            # Check if escalation to Pro is needed
+            if _should_escalate_to_pro(analysis):
+                _auto_state["status"] = f"第{rnd}轮: Pro 深度分析..."
+                _auto_broadcast("pro_start", msg="⚠ 触发升级条件 → DeepSeek Pro 深度分析中...")
+                try:
+                    analysis = _call_pro_decision_wrapper(market_summary, search_context, positions_block)
+                    used_model = "pro"
+                    _auto_broadcast("log", msg="✅ Pro 深度分析完成")
+                except Exception as e:
+                    _auto_broadcast("log", msg=f"⚠ Pro 调用失败, 使用 Flash 结果: {str(e)[:60]}")
+            else:
+                _auto_broadcast("log", msg="📋 Flash 决策足够 (无需Pro)")
 
             decisions = analysis.get("decisions", [])
             enrich_decisions(decisions, market_data)
             _auto_state["decisions"] = decisions
             _auto_broadcast("decisions", decisions=decisions,
                           research_summary=analysis.get("research_summary", ""),
-                          overall_analysis=analysis.get("overall_analysis", ""))
+                          overall_analysis=analysis.get("overall_analysis", ""),
+                          model=used_model)
 
+            # ===== Step 6: Execute trades & track positions =====
             actionable = [d for d in decisions if d.get("action") in ("BUY", "SELL")
                           and float(d.get("quantity", 0)) > 0]
             if actionable:
@@ -167,13 +389,35 @@ def _auto_trade_loop(interval):
                     try:
                         r = _execute_one_trade(sym, act, qty)
                         trade_info = r.get("trade", {})
+                        exec_price = trade_info.get("price", 0)
+                        exec_qty = trade_info.get("quantity", qty)
                         _auto_broadcast("trade_result", symbol=sym, action=act,
                                       status=r.get("status", "?"),
-                                      price=trade_info.get("price", 0) if r.get("status") == "success" else 0,
-                                      quantity=trade_info.get("quantity", 0),
+                                      price=exec_price if r.get("status") == "success" else 0,
+                                      quantity=exec_qty,
                                       error=r.get("error", ""))
+
                         if r.get("status") == "success":
-                            _auto_broadcast("log", msg=f"  ✅ {act} {sym} {trade_info.get('quantity', qty)} @ {trade_info.get('price', '?')}")
+                            _auto_broadcast("log", msg=f"  ✅ {act} {sym} {exec_qty} @ {exec_price}")
+
+                            # Track new BUY position with stop-loss and take-profit
+                            if act == "BUY":
+                                sl = float(d.get("stopLossPrice", 0))
+                                tp = float(d.get("takeProfitPrice", 0))
+                                _auto_state["positions"][sym] = {
+                                    "entry_price": exec_price,
+                                    "quantity": exec_qty,
+                                    "stop_loss": sl,
+                                    "take_profit": tp,
+                                    "entry_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                }
+                                _auto_broadcast("log", msg=f"  📌 跟踪持仓 {sym}: 止损 {sl} 止盈 {tp}")
+
+                            # Remove from tracking when SELL succeeds
+                            elif act == "SELL":
+                                if sym in _auto_state["positions"]:
+                                    del _auto_state["positions"][sym]
+                                    _auto_broadcast("log", msg=f"  📌 移除持仓 {sym}")
                         else:
                             _auto_broadcast("log", msg=f"  ⚠ {act} {sym}: {r.get('error', '?')}")
                     except Exception as e:
@@ -181,6 +425,7 @@ def _auto_trade_loop(interval):
             else:
                 _auto_broadcast("log", msg="📊 本轮无交易建议 (全部 HOLD)")
 
+            # ===== Step 7: Update PnL =====
             pnl = _calculate_pnl(load_trade_history())
             _auto_state["last_pnl"] = pnl
             _auto_broadcast("pnl", pnl=pnl)
@@ -195,14 +440,19 @@ def _auto_trade_loop(interval):
             _auto_broadcast("error", error=f"第{rnd}轮异常: {str(e)}")
 
         _auto_state["last_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        _auto_broadcast("round_done", round=rnd, next_round_in=interval)
+        _auto_broadcast("round_done", round=rnd, next_round_in=interval,
+                      positions=_auto_state.get("positions", {}))
 
         _auto_state["status"] = f"等待 {interval // 60} 分钟后下一轮..."
         wait_start = time.time()
         while _auto_state["running"] and (time.time() - wait_start) < interval:
             remaining = interval - int(time.time() - wait_start)
             if remaining % 30 == 0:
-                _auto_broadcast("waiting", remaining=remaining)
+                pos_count = len(_auto_state.get("positions", {}))
+                status = f"等待中... {remaining // 60}分{remaining % 60}秒"
+                if pos_count > 0:
+                    status += f" (持仓{pos_count}个)"
+                _auto_broadcast("waiting", remaining=remaining, positions=pos_count)
             time.sleep(1)
 
     _auto_state["status"] = "已停止"
@@ -283,43 +533,47 @@ def _make_market_summary(market_data, balances):
 
 
 def _search_loop(market_summary, pairs_str):
-    """Run the web search loop with Flash. Returns accumulated search_context string."""
+    """Single-round search: Flash direction → parallel Tavily → one summary. Optimized for minimal API calls."""
     search_context = ""
-    for round_num in range(MAX_WEB_SEARCH_ROUNDS):
-        q_prompt = SEARCH_TEMPLATE.format(
-            market_summary=market_summary, pairs_str=pairs_str)
 
-        try:
-            flash_resp = ask_flash([
-                {"role": "system", "content": SEARCH_SYSTEM},
-                {"role": "user", "content": q_prompt},
-            ], max_tokens=512)
-        except Exception as e:
-            logger.warning("Flash round %d failed: %s", round_num + 1, str(e))
-            break
+    q_prompt = SEARCH_TEMPLATE.format(market_summary=market_summary, pairs_str=pairs_str)
+    try:
+        flash_resp = ask_flash([
+            {"role": "system", "content": SEARCH_SYSTEM},
+            {"role": "user", "content": q_prompt},
+        ], max_tokens=512)
+    except Exception as e:
+        logger.warning("Flash search direction failed: %s", str(e))
+        return search_context
 
-        searches = parse_flash_search_response(flash_resp)
-        if not searches:
-            break
+    searches = parse_flash_search_response(flash_resp)
+    if not searches:
+        return search_context
 
-        logger.info("🔍 第 %d 轮联网搜索: %s", round_num + 1, searches)
-        round_results = []
-        for query in searches:
-            round_results.extend(search_web(query, num_results=3))
+    logger.info("🔍 联网搜索 (%d queries): %s", len(searches), searches)
 
-        if round_results:
-            results_text = "\n".join(
-                f"[{r['title']}] {r['snippet']}" for r in round_results[:10]
-            )
+    # Parallel search
+    all_results = []
+    with ThreadPoolExecutor(max_workers=min(len(searches), 5)) as pool:
+        futures = {pool.submit(search_web, q, 3): q for q in searches[:5]}
+        for future in as_completed(futures):
+            query = futures[future]
             try:
-                summary = ask_flash([
-                    {"role": "system", "content": SUMMARIZE_SYSTEM},
-                    {"role": "user", "content": SUMMARIZE_TEMPLATE.format(results_text=results_text)},
-                ], max_tokens=512)
-                search_context += f"\n## 第{round_num + 1}轮搜索结果\n{summary}\n"
-                logger.info("📝 Flash 总结搜索结果: %s", summary[:80])
+                all_results.extend(future.result())
             except Exception as e:
-                logger.warning("Flash summary failed: %s", str(e))
+                logger.warning("Search '%s' failed: %s", query[:30], str(e)[:60])
+
+    if all_results:
+        results_text = "\n---\n".join(f"[{r['title']}] {r['snippet']}" for r in all_results[:12])
+        try:
+            summary = ask_flash([
+                {"role": "system", "content": SUMMARIZE_SYSTEM},
+                {"role": "user", "content": SUMMARIZE_TEMPLATE.format(results_text=results_text)},
+            ], max_tokens=512)
+            search_context = f"\n{summary}\n"
+            logger.info("📝 搜索总结: %s", summary[:80])
+        except Exception as e:
+            logger.warning("Flash summary failed: %s", str(e))
 
     return search_context
 
@@ -327,7 +581,10 @@ def _search_loop(market_summary, pairs_str):
 def _call_pro_decision(market_summary, search_context):
     search_section = f"## 联网搜索情报{search_context}" if search_context else ""
     decision_prompt = DECISION_TEMPLATE.format(
-        market_summary=market_summary, search_context=search_section)
+        market_summary=market_summary,
+        search_context=search_section,
+        open_positions="(手动分析模式，无持仓追踪)",
+    )
 
     content = ask_pro([
         {"role": "system", "content": DECISION_SYSTEM},
@@ -354,14 +611,15 @@ def _execute_one_trade(symbol, action, quantity):
     if not filters:
         return {"symbol": symbol, "action": action, "status": "failed", "error": f"找不到 {symbol} 交易规则"}
 
-    step_size = float(filters.get("LOT_SIZE", {}).get("stepSize", "0.00000001"))
+    step_size_str = filters.get("LOT_SIZE", {}).get("stepSize", "0.00000001")
+    step_size = float(step_size_str)
     min_qty = float(filters.get("LOT_SIZE", {}).get("minQty", "0"))
     min_notional = float(filters.get("MIN_NOTIONAL", {}).get("minNotional", "10"))
 
     qty = float(quantity)
     prec = 0
-    if "." in str(step_size):
-        prec = len(str(step_size).split(".")[1].rstrip("0"))
+    if "." in step_size_str:
+        prec = len(step_size_str.split(".")[1].rstrip("0"))
     qty = round(max(qty, min_qty), prec)
 
     try:
@@ -423,64 +681,65 @@ def _run_deepseek_analysis_stream(market_data, balances):
     yield _sse({"event": "balance", "data": [{"asset": b["asset"], "total": b["total"], "cnyValue": b["cnyValue"]} for b in balances]})
 
     search_context = ""
-    for round_num in range(MAX_WEB_SEARCH_ROUNDS):
-        yield _sse({"event": "search_round", "round": round_num + 1, "status": "asking"})
 
-        q_prompt = SEARCH_TEMPLATE.format(
-            market_summary=market_summary, pairs_str=pairs_str)
+    # Single-round search: Flash direction → parallel Tavily → one summary
+    yield _sse({"event": "search_round", "round": 1, "status": "asking"})
+    q_prompt = SEARCH_TEMPLATE.format(market_summary=market_summary, pairs_str=pairs_str)
 
-        try:
-            flash_resp = ask_flash([
-                {"role": "system", "content": SEARCH_SYSTEM},
-                {"role": "user", "content": q_prompt},
-            ], max_tokens=512)
-        except Exception as e:
-            logger.warning("Flash round %d failed: %s", round_num + 1, str(e))
-            yield _sse({"event": "search_error", "round": round_num + 1, "error": str(e)[:100]})
-            break
+    try:
+        flash_resp = ask_flash([
+            {"role": "system", "content": SEARCH_SYSTEM},
+            {"role": "user", "content": q_prompt},
+        ], max_tokens=512)
+    except Exception as e:
+        logger.warning("Flash search direction failed: %s", str(e))
+        yield _sse({"event": "search_error", "round": 1, "error": str(e)[:100]})
+        flash_resp = ""
 
-        searches = parse_flash_search_response(flash_resp)
-        if "不需要" in flash_resp or "no need" in flash_resp.lower():
-            yield _sse({"event": "search_round", "round": round_num + 1, "status": "skip", "msg": "DeepSeek 判断无需额外搜索"})
-            break
-        if not searches:
-            yield _sse({"event": "search_round", "round": round_num + 1, "status": "skip", "msg": "无搜索关键词"})
-            break
+    searches = parse_flash_search_response(flash_resp) if flash_resp else []
+    if not searches:
+        yield _sse({"event": "search_round", "round": 1, "status": "skip", "msg": "无需搜索"})
+    else:
+        yield _sse({"event": "search_query", "round": 1, "queries": searches})
 
-        yield _sse({"event": "search_query", "round": round_num + 1, "queries": searches})
+        # Parallel search
+        all_results = []
+        with ThreadPoolExecutor(max_workers=min(len(searches), 5)) as pool:
+            futures = {pool.submit(search_web, q, 3): q for q in searches[:5]}
+            for future in as_completed(futures):
+                query = futures[future]
+                try:
+                    results = future.result()
+                    all_results.extend(results)
+                    yield _sse({"event": "search_found", "round": 1, "query": query, "count": len(results),
+                              "preview": results[0]["snippet"][:100] if results else ""})
+                except Exception as e:
+                    yield _sse({"event": "search_error", "round": 1, "error": str(e)[:80]})
 
-        round_results = []
-        for query in searches:
-            yield _sse({"event": "searching", "round": round_num + 1, "query": query})
-            results = search_web(query, num_results=3)
-            if results:
-                yield _sse({"event": "search_found", "round": round_num + 1, "query": query, "count": len(results),
-                            "preview": results[0]["snippet"][:100] if results else ""})
-            round_results.extend(results)
-
-        if round_results:
-            results_text = "\n".join(f"[{r['title']}] {r['snippet']}" for r in round_results[:10])
-            yield _sse({"event": "summarizing", "round": round_num + 1, "count": len(round_results)})
-
+        if all_results:
+            results_text = "\n---\n".join(f"[{r['title']}] {r['snippet']}" for r in all_results[:12])
+            yield _sse({"event": "summarizing", "round": 1, "count": len(all_results)})
             try:
                 summary = ask_flash([
                     {"role": "system", "content": SUMMARIZE_SYSTEM},
                     {"role": "user", "content": SUMMARIZE_TEMPLATE.format(results_text=results_text)},
                 ], max_tokens=512)
-                search_context += f"\n## 第{round_num + 1}轮搜索结果\n{summary}\n"
-                yield _sse({"event": "search_summary", "round": round_num + 1, "summary": summary})
+                search_context = f"\n{summary}\n"
+                yield _sse({"event": "search_summary", "round": 1, "summary": summary})
             except Exception as e:
-                logger.warning("Flash summary failed: %s", str(e))
-                yield _sse({"event": "search_error", "round": round_num + 1, "error": str(e)[:100]})
+                yield _sse({"event": "search_error", "round": 1, "error": str(e)[:80]})
         else:
-            yield _sse({"event": "search_round", "round": round_num + 1, "status": "no_results", "msg": f"搜索 '{' '.join(searches)}' 无结果"})
+            yield _sse({"event": "search_round", "round": 1, "status": "no_results", "msg": "搜索无结果"})
 
     yield _sse({"event": "pro_start", "msg": "发送完整数据到 DeepSeek-V4-Pro 进行最终决策..."})
 
     try:
         search_section = f"## 联网搜索情报{search_context}" if search_context else ""
         decision_prompt = DECISION_TEMPLATE.format(
-            market_summary=market_summary, search_context=search_section)
+            market_summary=market_summary,
+            search_context=search_section,
+            open_positions="(手动分析模式，无持仓追踪)",
+        )
         content = ask_pro([
             {"role": "system", "content": DECISION_SYSTEM},
             {"role": "user", "content": decision_prompt},
@@ -720,18 +979,22 @@ def auto_trade_start():
     _auto_state["decisions"] = []
     _auto_state["last_pnl"] = None
     _auto_state["last_time"] = None
+    _auto_state["last_search_time"] = 0
+    _auto_state["cached_search_context"] = ""
+    _auto_state["positions"] = {}
 
     with _auto_lock:
         _auto_events.clear()
 
-    _auto_broadcast("auto_started", interval=interval)
-    logger.info("🚀 全自动交易启动, 间隔 %ds", interval)
+    _auto_broadcast("auto_started", interval=interval, search_interval=_auto_state["search_interval"],
+                  positions={})
+    logger.info("🚀 全自动交易启动, 间隔 %ds, 搜索间隔 %ds", interval, _auto_state["search_interval"])
 
     thread = threading.Thread(target=_auto_trade_loop, args=(interval,), daemon=True)
     thread.start()
     _auto_state["thread"] = thread
 
-    return jsonify({"status": "started", "interval": interval})
+    return jsonify({"status": "started", "interval": interval, "search_interval": _auto_state["search_interval"]})
 
 
 @trade_bp.route("/api/trade/auto-stop", methods=["POST"])
@@ -753,8 +1016,11 @@ def auto_trade_status():
         "lastTime": _auto_state["last_time"],
         "status": _auto_state["status"],
         "interval": _auto_state["interval"],
+        "search_interval": _auto_state.get("search_interval", 7200),
+        "last_search_time": _auto_state.get("last_search_time", 0),
         "decisions": _auto_state["decisions"],
         "pnl": _auto_state.get("last_pnl"),
+        "positions": _auto_state.get("positions", {}),
     })
 
 

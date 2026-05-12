@@ -346,6 +346,7 @@
                     <div id="autoControls" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
                         <button class="trade-btn buy" id="btnAutoStart" onclick="startAutoTrade()" style="padding:10px 24px;font-size:14px;">▶ 开始全自动交易</button>
                         <button class="trade-btn sell" id="btnAutoStop" onclick="stopAutoTrade()" style="padding:10px 24px;font-size:14px;display:none;">⏹ 停止</button>
+                        <button class="trade-btn primary" id="btnAnalyze" onclick="runSingleAnalysis()" style="padding:10px 20px;font-size:14px;">📊 分析</button>
                         <select id="autoInterval" style="padding:8px 10px;border-radius:6px;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.06);color:#ccc;font-size:13px;">
                             <option value="300">5 分钟</option>
                             <option value="600" selected>10 分钟</option>
@@ -362,7 +363,13 @@
                 <div id="autoLogLines" style="max-height:420px;overflow-y:auto;font-size:12px;font-family:'SF Mono','Fira Code','Consolas',monospace;border-radius:6px;background:rgba(0,0,0,0.2);padding:10px;"></div>
             </div>
 
+            <div id="analysisResults" style="display:none;"></div>
+            <div id="analysisConfirmBar" style="display:none;"></div>
             <div id="autoDecisions" style="display:none;"></div>
+            <div id="autoPositions" style="display:none;">
+                <div class="trade-section-title">📌 持仓跟踪 <span id="autoPosCount" style="font-size:11px;color:#888;font-weight:normal;"></span></div>
+                <div class="table-wrap" id="autoPositionsTable"></div>
+            </div>
             <div class="trade-section-title">📋 交易记录</div>
             <div class="table-wrap" id="tradeLogTable"></div>
             <div class="trade-section-title">📊 盈亏汇总</div>
@@ -855,7 +862,7 @@
             }
         }
 
-        function renderAutoDecisions(decisions, researchSummary, overallAnalysis) {
+        function renderAutoDecisions(decisions, researchSummary, overallAnalysis, model) {
             if (!decisions || decisions.length === 0) {
                 document.getElementById("autoDecisions").style.display = "none";
                 return;
@@ -870,8 +877,10 @@
                 return `<span class="decision-badge ${cls}">${k}: ${v}</span>`;
             }).join(" ");
 
+            const modelTag = model === "pro" ? '<span style="color:#f0b90b;font-size:10px;">(Pro)</span>' : '<span style="color:#888;font-size:10px;">(Flash)</span>';
+
             let html = `<div class="analysis-card">`;
-            html += `<h3>📊 最新 AI 决策 <span style="font-size:11px;color:#666;font-weight:normal;">${summaryBadges}</span></h3>`;
+            html += `<h3>📊 最新 AI 决策 ${modelTag} <span style="font-size:11px;color:#666;font-weight:normal;">${summaryBadges}</span></h3>`;
             if (researchSummary) html += `<div style="color:#4ecdc4;font-size:12px;margin-bottom:10px;padding:8px 12px;background:rgba(78,205,196,0.06);border-radius:6px;">🌐 ${researchSummary}</div>`;
             if (overallAnalysis) html += `<div class="overall">${overallAnalysis}</div>`;
             decisions.forEach(d => {
@@ -900,11 +909,40 @@
             document.getElementById("autoDecisions").innerHTML = html;
         }
 
+        function renderPositionsTable(positions) {
+            const el = document.getElementById("autoPositions");
+            const tbl = document.getElementById("autoPositionsTable");
+            const cnt = document.getElementById("autoPosCount");
+            if (!positions || Object.keys(positions).length === 0) {
+                el.style.display = "none";
+                return;
+            }
+            el.style.display = "block";
+            cnt.textContent = `(${Object.keys(positions).length} 个持仓)`;
+            const rows = Object.entries(positions).map(([sym, pos]) => {
+                const sl = pos.stop_loss ? `$${fmtNum(pos.stop_loss)}` : "-";
+                const tp = pos.take_profit ? `$${fmtNum(pos.take_profit)}` : "-";
+                return `<tr>
+                    <td><span class="asset-name">${sym}</span></td>
+                    <td class="mono">${fmtNum(pos.quantity)}</td>
+                    <td class="mono">$${fmtNum(pos.entry_price)}</td>
+                    <td class="mono" style="color:#e74c3c;">${sl}</td>
+                    <td class="mono" style="color:#00d4aa;">${tp}</td>
+                    <td>${pos.entry_time || "-"}</td>
+                </tr>`;
+            }).join("");
+            tbl.innerHTML = `<table>
+                <thead><tr><th>交易对</th><th>数量</th><th>入场价</th><th>止损价</th><th>止盈价</th><th>入场时间</th></tr></thead>
+                <tbody>${rows}</tbody>
+            </table>`;
+        }
+
         function handleAutoEvent(evt) {
             const e = evt.event;
             if (e === "auto_started") {
                 addAutoLog("🚀 全自动交易已启动", "#f0b90b");
-                addAutoLog(`   间隔: ${Math.floor(evt.interval / 60)} 分钟`, "#888");
+                addAutoLog(`   交易间隔: ${Math.floor(evt.interval / 60)} 分钟 | 搜索间隔: ${Math.floor((evt.search_interval||7200) / 3600)} 小时`, "#888");
+                renderPositionsTable(evt.positions || {});
             } else if (e === "round_start") {
                 addAutoLog("", "#888");
                 addAutoLog(`🔄 第 ${evt.round} 轮开始 ${evt.time || ""}`, "#f0b90b");
@@ -943,7 +981,7 @@
                     const c = d.action === "BUY" ? "#00d4aa" : d.action === "SELL" ? "#e74c3c" : "#888";
                     addAutoLog(`   ${d.symbol} → ${d.action} qty=${d.quantity} ≈${d.estimatedUsdt||0}USDT | ${d.reason||''}`, c);
                 });
-                renderAutoDecisions(evt.decisions, evt.research_summary, evt.overall_analysis);
+                renderAutoDecisions(evt.decisions, evt.research_summary, evt.overall_analysis, evt.model);
                 document.getElementById("autoStatusTag").textContent = "执行交易中...";
             } else if (e === "trade_result") {
                 if (evt.status === "success") {
@@ -968,6 +1006,7 @@
                 addAutoLog(`✅ 第${evt.round}轮完成, ${Math.floor((evt.next_round_in||0)/60)}分钟后下一轮`, "#00d4aa");
                 document.getElementById("autoStatusTag").textContent = `等待 ${Math.floor((evt.next_round_in||0)/60)} 分钟...`;
                 document.getElementById("autoLastTime").textContent = nowStr();
+                renderPositionsTable(evt.positions || {});
                 loadTradeHistory();
             } else if (e === "waiting") {
                 document.getElementById("autoStatusTag").textContent = `等待中... ${Math.floor((evt.remaining||0)/60)}分${(evt.remaining||0)%60}秒`;
@@ -1076,8 +1115,201 @@
             updateAutoUI(false);
             document.getElementById("autoStatusText").innerHTML = '<span style="color:#888;">⚪ 已停止</span>';
             document.getElementById("autoStatusTag").textContent = "";
+            document.getElementById("autoPositions").style.display = "none";
             document.getElementById("lastUpdated").textContent = "停止于 " + nowStr();
             loadTradeHistory();
+        }
+
+        // ===== Single Analysis (manual review before execute) =====
+        let analysisData = null;
+
+        async function runSingleAnalysis() {
+            document.getElementById("analysisResults").style.display = "none";
+            document.getElementById("analysisConfirmBar").style.display = "none";
+            analysisData = null;
+
+            // Show live log if not already visible
+            const liveLog = document.getElementById("autoLiveLog");
+            const logLines = document.getElementById("autoLogLines");
+            liveLog.style.display = "block";
+            logLines.innerHTML = "";
+            addAutoLog("📊 开始单次分析...", "#f0b90b");
+            document.getElementById("autoStatusTag").textContent = "手动分析中...";
+
+            try {
+                const resp = await fetch("/api/trade/analyze-stream");
+                const reader = resp.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = "";
+
+                while (true) {
+                    const {done, value} = await reader.read();
+                    if (done) break;
+                    buffer += decoder.decode(value, {stream: true});
+                    const lines = buffer.split("\n");
+                    buffer = lines.pop();
+                    for (const line of lines) {
+                        if (!line.trim()) continue;
+                        try {
+                            handleAnalyzeEvent(JSON.parse(line));
+                        } catch (e) { /* skip */ }
+                    }
+                }
+            } catch (err) {
+                addAutoLog(`❌ 分析失败: ${err.message}`, "#e74c3c");
+                document.getElementById("autoStatusTag").textContent = "";
+            }
+        }
+
+        function handleAnalyzeEvent(evt) {
+            const e = evt.event;
+            if (e === "log") {
+                addAutoLog(evt.msg, "#888");
+            } else if (e === "collect_pair") {
+                const change = evt.change;
+                const c = change > 0 ? "#00d4aa" : change < 0 ? "#e74c3c" : "#888";
+                const s = change != null ? `  ${change>=0?'+':''}${change}%` : "";
+                addAutoLog(`  📊 ${evt.pair} ${evt.price ?? '?'}${s}`, c);
+            } else if (e === "balance") {
+                addAutoLog("💰 账户余额已获取", "#f0b90b");
+                (evt.data || []).forEach(b => {
+                    addAutoLog(`   ${b.asset}: ${b.total} (≈¥${b.cnyValue})`, "#4ecdc4");
+                });
+            } else if (e === "search_round") {
+                if (evt.status === "asking") {
+                    addAutoLog(`🔍 第${evt.round}轮搜索: 询问搜索方向...`, "#f0b90b");
+                } else if (evt.status === "skip") {
+                    addAutoLog(`  ⏭ ${evt.msg}`, "#888");
+                }
+            } else if (e === "search_query") {
+                addAutoLog(`  📋 搜索: ${(evt.queries||[]).join(', ')}`, "#4ecdc4");
+            } else if (e === "searching") {
+                addAutoLog(`    🔎 ${evt.query}...`, "#aaa");
+            } else if (e === "search_found") {
+                addAutoLog(`    ✅ "${evt.query}" → ${evt.count} 条结果`, "#00d4aa");
+            } else if (e === "summarizing") {
+                addAutoLog(`    📝 总结中...`, "#f0b90b");
+            } else if (e === "search_summary") {
+                addAutoLog(`    📝 ${evt.summary}`, "#ccc");
+            } else if (e === "search_error") {
+                addAutoLog(`    ⚠ 搜索出错: ${evt.error}`, "#e74c3c");
+            } else if (e === "pro_start") {
+                addAutoLog("🤖 DeepSeek Pro 最终决策中...", "#f0b90b");
+                document.getElementById("autoStatusTag").textContent = "AI决策中...";
+            } else if (e === "pro_done") {
+                addAutoLog(`✅ Pro 返回 ${evt.length} 字符`, "#00d4aa");
+            } else if (e === "decisions") {
+                addAutoLog("📊 分析结果 ↓", "#f0b90b");
+                (evt.decisions || []).forEach(d => {
+                    const c = d.action === "BUY" ? "#00d4aa" : d.action === "SELL" ? "#e74c3c" : "#888";
+                    addAutoLog(`   ${d.symbol} → ${d.action} qty=${d.quantity} ≈${d.estimatedUsdt||0}USDT | ${d.reason||''}`, c);
+                });
+                const thisAnalysis = {marketData: evt.marketData, analysis: evt};
+                analysisData = thisAnalysis;
+                renderAnalysisResults(thisAnalysis);
+                renderAnalysisConfirmBar(thisAnalysis);
+                document.getElementById("autoStatusTag").textContent = "分析完成";
+                document.getElementById("lastUpdated").textContent = "分析于 " + nowStr();
+            } else if (e === "done") {
+                addAutoLog("✅ 分析完成！", "#00d4aa");
+            } else if (e === "error") {
+                addAutoLog(`❌ ${evt.error}`, "#e74c3c");
+                document.getElementById("autoStatusTag").textContent = "";
+            }
+        }
+
+        function renderAnalysisResults(data) {
+            const analysis = data.analysis || {};
+            const decisions = analysis.decisions || [];
+            const overall = analysis.overall_analysis || "";
+            const research = analysis.research_summary || "";
+
+            const actionSummary = {};
+            decisions.forEach(d => {
+                const a = d.action || "HOLD";
+                actionSummary[a] = (actionSummary[a] || 0) + 1;
+            });
+            const badges = Object.entries(actionSummary).map(([k, v]) => {
+                const cls = k === "BUY" ? "badge-buy" : k === "SELL" ? "badge-sell" : "badge-hold";
+                return `<span class="decision-badge ${cls}">${k}: ${v}</span>`;
+            }).join(" ");
+
+            const totalBuy = decisions.filter(d => d.action === "BUY")
+                .reduce((s, d) => s + (parseFloat(d.estimatedUsdt) || 0), 0);
+
+            let html = `<div class="analysis-card">
+                <h3>🤖 DeepSeek 分析报告 ${badges} ${totalBuy > 0 ? `<span style="color:#00d4aa;font-size:12px;margin-left:8px;">买入预估: ≈${fmtNum(totalBuy,2)} USDT</span>` : ''}</h3>
+                ${research ? `<div style="color:#4ecdc4;font-size:12px;margin-bottom:10px;padding:8px 12px;background:rgba(78,205,196,0.06);border-radius:6px;">🌐 ${research}</div>` : ''}
+                <div class="overall">${overall}</div>`;
+            decisions.forEach(d => { html += renderDecisionCard(d); });
+            html += `</div>`;
+            document.getElementById("analysisResults").style.display = "block";
+            document.getElementById("analysisResults").innerHTML = html;
+        }
+
+        function renderAnalysisConfirmBar(data) {
+            const decisions = (data.analysis || {}).decisions || [];
+            const actionable = decisions.filter(d => d.action === "BUY" || d.action === "SELL");
+            if (actionable.length === 0) {
+                document.getElementById("analysisConfirmBar").style.display = "none";
+                return;
+            }
+            const totalEst = actionable.reduce((s, d) => s + (parseFloat(d.estimatedUsdt) || 0), 0);
+            document.getElementById("analysisConfirmBar").style.display = "block";
+            document.getElementById("analysisConfirmBar").innerHTML = `
+            <div class="analysis-card" style="border-color:rgba(0,212,170,0.2);background:rgba(0,212,170,0.03);">
+                <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;">
+                    <div>
+                        <span style="color:#00d4aa;font-weight:600;">共 ${actionable.length} 笔交易建议</span>
+                        <span style="color:#ccc;margin-left:8px;">预计总金额: ≈ ${fmtNum(totalEst, 2)} USDT</span>
+                    </div>
+                    <button class="trade-btn buy" onclick="executeAnalyzedTrades()" style="padding:12px 32px;font-size:14px;">
+                        ✅ 同意建议，执行交易
+                    </button>
+                </div>
+            </div>`;
+        }
+
+        async function executeAnalyzedTrades() {
+            if (!analysisData) return;
+            const decisions = (analysisData.analysis || {}).decisions || [];
+            const actionable = decisions.filter(d => d.action === "BUY" || d.action === "SELL");
+
+            let msg = "即将执行以下交易:\n\n";
+            actionable.forEach(d => {
+                msg += `  ${d.action} ${d.symbol} x ${d.quantity} ≈ ${d.estimatedUsdt || 0} USDT\n`;
+            });
+            msg += "\n确认执行？";
+            if (!confirm(msg)) return;
+
+            document.getElementById("analysisConfirmBar").style.display = "none";
+            addAutoLog("💱 正在执行交易...", "#f0b90b");
+
+            try {
+                const resp = await fetch("/api/trade/execute-all", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ decisions: actionable }),
+                });
+                const data = await resp.json();
+                const results = data.results || [];
+                const summary = data.summary || {};
+
+                results.forEach(r => {
+                    if (r.status === "success") {
+                        addAutoLog(`  ✅ ${r.symbol} ${r.action || '?'} @ ${fmtNum(r.trade?.price)}`, "#00d4aa");
+                    } else if (r.status === "skipped") {
+                        addAutoLog(`  ⏭ ${r.symbol}: ${r.error || '跳过'}`, "#f0b90b");
+                    } else {
+                        addAutoLog(`  ❌ ${r.symbol}: ${r.error || '失败'}`, "#e74c3c");
+                    }
+                });
+                addAutoLog(`📊 交易完成: 成功${summary.success} 失败${summary.failed} 跳过${summary.skipped}`, "#f0b90b");
+                document.getElementById("lastUpdated").textContent = "交易于 " + nowStr();
+            } catch (err) {
+                addAutoLog(`❌ 执行失败: ${err.message}`, "#e74c3c");
+            }
+            await loadTradeHistory();
         }
 
         function renderDecisionCard(d) {
