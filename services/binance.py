@@ -54,6 +54,8 @@ def _signed_request(method, endpoint, params=None):
         start = time.time()
         if method == "GET":
             resp = requests.get(url, headers=headers, params=p, timeout=30)
+        elif method == "DELETE":
+            resp = requests.delete(url, headers=headers, params=p, timeout=30)
         else:
             resp = requests.post(url, headers=headers, data=p, timeout=30)
         elapsed = (time.time() - start) * 1000
@@ -148,8 +150,13 @@ def get_current_price(symbol):
     return float(data["price"])
 
 
+def _fmt_qty(qty):
+    """Format quantity to avoid scientific notation or excessive decimals."""
+    return f"{float(qty):.8f}".rstrip("0").rstrip(".")
+
+
 def execute_order(symbol, side, quantity):
-    params = {"symbol": symbol, "side": side, "type": "MARKET", "quantity": str(quantity)}
+    params = {"symbol": symbol, "side": side, "type": "MARKET", "quantity": _fmt_qty(quantity)}
     return _signed_request("POST", "/api/v3/order", params)
 
 
@@ -182,7 +189,7 @@ def margin_repay(asset, amount):
 
 def margin_order(symbol, side, quantity):
     """Place a margin trade order (side=SELL to short, side=BUY to cover)."""
-    params = {"symbol": symbol, "side": side, "type": "MARKET", "quantity": str(quantity)}
+    params = {"symbol": symbol, "side": side, "type": "MARKET", "quantity": _fmt_qty(quantity)}
     return _signed_request("POST", "/sapi/v1/margin/order", params)
 
 
@@ -190,7 +197,7 @@ def stop_loss_order(symbol, quantity, stop_price):
     """Place a STOP_LOSS market order (triggers market sell when stopPrice is hit)."""
     params = {
         "symbol": symbol, "side": "SELL", "type": "STOP_LOSS",
-        "quantity": str(quantity), "stopPrice": str(stop_price),
+        "quantity": _fmt_qty(quantity), "stopPrice": str(stop_price),
     }
     return _signed_request("POST", "/api/v3/order", params)
 
@@ -202,7 +209,7 @@ def oco_order(symbol, quantity, stop_price, take_profit_price):
     params = {
         "symbol": symbol,
         "side": "SELL",
-        "quantity": str(quantity),
+        "quantity": _fmt_qty(quantity),
         "price": str(take_profit_price),  # limit price for take-profit
         "stopPrice": str(stop_price),  # stop trigger
         "stopLimitPrice": str(stop_limit_price),  # limit price after stop triggers

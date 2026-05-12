@@ -34,11 +34,40 @@ def strip_markdown_code(text):
     """Remove markdown code block fences from a response string."""
     t = text.strip()
     if t.startswith("```"):
-        t = t.split("\n", 1)[-1]
-        if t.endswith("```"):
-            t = t[:-3]
+        parts = t.split("\n", 1)
+        if len(parts) > 1:
+            t = parts[1]
+        else:
+            t = t[3:]
+        # Find last ``` and remove it + anything after
+        idx = t.rfind("```")
+        if idx >= 0:
+            t = t[:idx]
         t = t.strip()
     return t
+
+
+def repair_json(text):
+    """Try to fix common JSON errors from LLM output."""
+    import re
+    t = text.strip()
+    fixes = [
+        t,  # original
+        re.sub(r',\s*([}\]])', r'\1', t),  # trailing comma before ] or }
+    ]
+    # Try closing unclosed braces/brackets
+    opens = sum(1 for c in t if c in "[{")
+    closes = sum(1 for c in t if c in "]}")
+    if opens > closes:
+        missing = "]" * (t.count("[") - t.count("]")) + "}" * (t.count("{") - t.count("}"))
+        fixes.append(t.rstrip() + missing)
+    for attempt in fixes:
+        try:
+            return json.loads(attempt)
+        except (json.JSONDecodeError, ValueError):
+            continue
+    raise ValueError(f"JSON repair failed. Raw: {t[:200]}")
+
 
 
 def parse_flash_search_response(flash_resp):

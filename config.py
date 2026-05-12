@@ -37,13 +37,13 @@ KLINE_LIMITS = {"1h": 50, "4h": 50, "1d": 50}
 MAX_WEB_SEARCH_ROUNDS = 1  # single round, Flash suggests queries once, we search & summarize
 
 # Aggressiveness: 0=conservative 1=cautious 2=moderate 3=neutral(default) 4=aggressive 5=yolo
-AGGRESSIVENESS = int(os.getenv("AGGRESSIVENESS", "3"))
+AGGRESSIVENESS = int(os.getenv("AGGRESSIVENESS", "3"))  # 稳健: 只做现货，不做杠杆
 
-if not logging.getLogger().handlers:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    force=True,
+)
 logger = logging.getLogger(__name__)
 logging.getLogger("werkzeug").setLevel(logging.WARNING)

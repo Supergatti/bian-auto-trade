@@ -16,7 +16,7 @@ from services.data_store import (
     append_trade_record, record_balance_snapshot,
 )
 from utils.files import load_json, save_json
-from utils.helpers import strip_markdown_code, parse_flash_search_response, enrich_decisions
+from utils.helpers import strip_markdown_code, parse_flash_search_response, enrich_decisions, repair_json
 from services.binance import (
     collect_all_pairs_data, get_account, get_balances,
     get_symbol_filters, get_current_price, execute_order,
@@ -34,12 +34,6 @@ from services.prompts import (
 )
 
 trade_bp = Blueprint("trade", __name__)
-
-# Escalate to Pro when Flash suggests a trade above this USD threshold
-ESCALATE_USDT_THRESHOLD = 100
-# Keywords that trigger Pro escalation regardless of trade size
-ESCALATE_KEYWORDS = ["crash", "暴跌", "崩盘", "hack", "黑客", "regulation", "监管",
-                     "ban", "禁止", "delist", "下架", "sec", "lawsuit", "诉讼"]
 
 # ===== Auto-Trading State =====
 _auto_state = {
@@ -107,20 +101,22 @@ def _check_positions(market_data):
         if reason:
             logger.info(reason)
             _auto_broadcast("log", msg=reason)
+            # Cancel OCO FIRST to unlock coins, then sell
+            oid = pos.get("stop_order_id")
+            if oid:
+                try:
+                    cancel_oco_order(symbol, oid)
+                    _auto_broadcast("log", msg=f"  🔓 已取消OCO {symbol} (ID:{oid})")
+                except Exception:
+                    try:
+                        cancel_order(symbol, oid)
+                        _auto_broadcast("log", msg=f"  🔓 已取消订单 {symbol} (ID:{oid})")
+                    except Exception:
+                        pass
             try:
                 r = _execute_one_trade(symbol, "SELL", qty)
                 trade_info = r.get("trade", {})
                 if r.get("status") == "success":
-                    # Cancel the exchange OCO/stop-loss order
-                    oid = pos.get("stop_order_id")
-                    if oid:
-                        try:
-                            cancel_oco_order(symbol, oid)
-                        except Exception:
-                            try:
-                                cancel_order(symbol, oid)
-                            except Exception:
-                                pass
                     _auto_broadcast("log", msg=f"  ✅ 自动平仓 {symbol} x {qty} @ {current_price}")
                     _auto_broadcast("trade_result", symbol=symbol, action="SELL",
                                   status="success", price=current_price, quantity=qty,
@@ -231,18 +227,18 @@ def _do_full_search(market_summary, pairs_str, depth="deep"):
 def _get_aggressiveness_profile():
     """Return (profile_dict, prompt_context) for the current aggressiveness level."""
     levels = {
-        0: {"name": "保守", "cash_reserve": 0.50, "max_position": 0.10, "leverage": False,
-            "shorts": False, "style": "极少交易，持有现金为主，只在极度确定性下小仓位买入现货"},
-        1: {"name": "谨慎", "cash_reserve": 0.40, "max_position": 0.15, "leverage": False,
-            "shorts": False, "style": "精选交易，留足现金，只做现货买入，不做空"},
-        2: {"name": "稳健", "cash_reserve": 0.30, "max_position": 0.25, "leverage": False,
-            "shorts": True, "style": "适度交易，可以做空现货，不使用杠杆"},
-        3: {"name": "中性", "cash_reserve": 0.20, "max_position": 0.40, "leverage": True,
-            "shorts": True, "style": "积极交易，使用杠杆做空，中等仓位"},
-        4: {"name": "积极", "cash_reserve": 0.10, "max_position": 0.50, "leverage": True,
-            "shorts": True, "style": "激进交易，大仓位，主动做空，敢于重仓看好币种"},
-        5: {"name": "激进", "cash_reserve": 0.05, "max_position": 0.60, "leverage": True,
-            "shorts": True, "style": "YOLO模式，满仓操作，大幅杠杆做空，追求最高收益"},
+        0: {"name": "保守", "cash_reserve": 0.50, "max_position": 0.10,
+            "style": "极少交易，持有现金为主，只在极度确定性下小仓位买入"},
+        1: {"name": "谨慎", "cash_reserve": 0.40, "max_position": 0.15,
+            "style": "精选交易，留足现金，只做现货买入"},
+        2: {"name": "稳健", "cash_reserve": 0.30, "max_position": 0.25,
+            "style": "适度交易，分散持仓"},
+        3: {"name": "中性", "cash_reserve": 0.20, "max_position": 0.40,
+            "style": "积极交易，中等仓位，主动管理持仓"},
+        4: {"name": "积极", "cash_reserve": 0.10, "max_position": 0.50,
+            "style": "激进交易，大仓位，敢于重仓看好币种"},
+        5: {"name": "激进", "cash_reserve": 0.05, "max_position": 0.60,
+            "style": "YOLO模式，满仓操作，追求最高收益"},
     }
     lvl = max(0, min(5, AGGRESSIVENESS))
     return levels[lvl], lvl
@@ -261,20 +257,14 @@ def _build_risk_rules(total_cny=0):
         f"单币上限${max_per_coin} USDT(总资产{int(profile['max_position']*100)}%)。"
         f"至少保留${cash_keep} USDT现金(总资产{int(profile['cash_reserve']*100)}%)。"
     )
-    if profile["leverage"]:
-        rules += "允许margin_short杠杆做空。非常看好的币种可用杠杆。"
-    else:
-        rules += "禁止使用margin_short杠杆。只能现货卖出已有持仓。"
-    if not profile["shorts"]:
-        rules += "禁止做空。"
+    rules += "只做现货，不借币不做空。"
 
     return rules, profile, lvl
 
 
 def _should_allow_margin_short():
-    """Check if current aggressiveness allows margin shorting."""
-    profile, _ = _get_aggressiveness_profile()
-    return profile["leverage"]
+    """Margin shorting is disabled globally."""
+    return False
 
 
 def _get_max_position_pct():
@@ -291,8 +281,8 @@ def _build_execution_context():
     return "## 上轮执行结果\n（首轮或上轮无交易）"
 
 
-def _call_flash_decision(market_summary, search_context, positions_block, max_retries=3, risk_rules=""):
-    """Call DeepSeek Flash for a quick trading decision. Retries on JSON parse failure."""
+def _call_flash_analysis(market_summary, search_context, positions_block, risk_rules=""):
+    """Call DeepSeek Flash for text analysis only (no JSON). Returns analysis string."""
     search_section = f"## 联网搜索情报{search_context}" if search_context else "## 联网搜索情报\n(暂无搜索数据)"
     prompt = FLASH_DECISION_TEMPLATE.format(
         market_summary=market_summary,
@@ -301,78 +291,41 @@ def _call_flash_decision(market_summary, search_context, positions_block, max_re
         risk_rules=risk_rules or _build_risk_rules()[0],
         last_execution=_build_execution_context(),
     )
-    last_content = ""
-    for attempt in range(max_retries):
-        try:
-            content = ask_flash([
-                {"role": "system", "content": FLASH_DECISION_SYSTEM},
-                {"role": "user", "content": prompt},
-            ], max_tokens=1024)
-            last_content = content
-            return json.loads(strip_markdown_code(content))
-        except (json.JSONDecodeError, ValueError) as e:
-            logger.warning("Flash JSON 解析失败 (attempt %d/%d): %s", attempt + 1, max_retries, str(e)[:80])
-            if attempt < max_retries - 1:
-                prompt = prompt + f"\n\n上次你返回的JSON格式错误({str(e)[:60]})。请严格返回合法JSON，不要加注释或多余文字。"
-                time.sleep(1)
-    # All retries exhausted — return HOLD for all pairs as safe fallback
-    logger.error("Flash JSON 全部重试失败，回退到全HOLD。最后输出: %s", last_content[:200])
-    _auto_broadcast("log", msg="⚠ Flash JSON连续解析失败，本轮全HOLD")
-    # Extract pair names from market summary
-    pairs = []
-    for line in market_summary.split("\n"):
-        if line.startswith("### "):
-            pairs.append(line.replace("### ", "").strip())
-    return {
-        "overall_analysis": "Flash JSON解析失败，全HOLD",
-        "decisions": [{"symbol": p, "trend": "震荡", "action": "HOLD", "quantity": 0, "reason": "模型异常", "estimatedUsdt": 0, "risk": "低"} for p in pairs],
-    }
-
-
-def _should_escalate_to_pro(flash_analysis):
-    """Check if Flash's decisions warrant escalation to Pro."""
-    decisions = flash_analysis.get("decisions", [])
-    search_context = _auto_state.get("cached_search_context", "")
-
-    # Check search context for alarming keywords
-    ctx_lower = search_context.lower()
-    for kw in ESCALATE_KEYWORDS:
-        if kw.lower() in ctx_lower:
-            logger.info("⚠ 搜索情报含关键词 '%s', 升级到 Pro", kw)
-            return True
-
-    for d in decisions:
-        action = d.get("action", "HOLD")
-        est = float(d.get("estimatedUsdt", 0))
-
-        # SELL decision → escalate
-        if action == "SELL" and est > 0:
-            logger.info("⚠ Flash 建议卖出 %s ≈$%.2f, 升级到 Pro", d.get("symbol"), est)
-            return True
-
-        # BUY above threshold → escalate
-        if action == "BUY" and est > ESCALATE_USDT_THRESHOLD:
-            logger.info("⚠ Flash 建议买入 %s ≈$%.2f > $%d, 升级到 Pro", d.get("symbol"), est, ESCALATE_USDT_THRESHOLD)
-            return True
-
-    return False
+    try:
+        content = ask_flash([
+            {"role": "system", "content": FLASH_DECISION_SYSTEM},
+            {"role": "user", "content": prompt},
+        ], max_tokens=256)
+        return content.strip() if content else ""
+    except Exception as e:
+        logger.warning("Flash 分析失败: %s", str(e)[:80])
+        return ""
 
 
 def _call_pro_decision_wrapper(market_summary, search_context, positions_block, risk_rules=""):
-    """Call DeepSeek Pro for a final trading decision."""
+    """Call DeepSeek Pro for a final trading decision. Retries on JSON parse failure."""
     search_section = f"## 联网搜索情报{search_context}" if search_context else "## 联网搜索情报\n(暂无搜索数据)"
-    prompt = DECISION_TEMPLATE.format(
+    base_prompt = DECISION_TEMPLATE.format(
         market_summary=market_summary,
         search_context=search_section,
         open_positions=positions_block,
         risk_rules=risk_rules or _build_risk_rules()[0],
         last_execution=_build_execution_context(),
     )
-    content = ask_pro([
-        {"role": "system", "content": DECISION_SYSTEM},
-        {"role": "user", "content": prompt},
-    ])
-    return json.loads(strip_markdown_code(content))
+    prompt = base_prompt
+    for attempt in range(3):
+        try:
+            content = ask_pro([
+                {"role": "system", "content": DECISION_SYSTEM},
+                {"role": "user", "content": prompt},
+            ], max_tokens=4096)
+            return repair_json(strip_markdown_code(content))
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.warning("Pro JSON 解析失败 (attempt %d/3): %s", attempt + 1, str(e)[:80])
+            if attempt < 2:
+                prompt = base_prompt + f"\n\n(上次JSON错误: {str(e)[:60]}。请输出合法JSON，字符串用英文双引号，不要换行)"
+                time.sleep(2)
+    raise RuntimeError("Pro JSON 3次重试均失败")
 
 
 def _auto_trade_loop(interval):
@@ -476,9 +429,20 @@ def _auto_trade_loop(interval):
                 if search_context:
                     _auto_broadcast("log", msg=f"📋 缓存概要: {search_context[:150]}...")
 
-            # ===== Step 4: Build open positions summary for Pro =====
+            # ===== Step 4: Build open positions + orders summary for Pro =====
             positions_block = ""
             current_positions = _auto_state.get("positions", {})
+            # Fetch open orders for order context
+            open_orders = []
+            try:
+                open_orders = get_open_orders()
+            except Exception:
+                pass
+            # Map asset -> locked balance
+            locked_map = {}
+            for b in bal_list:
+                locked_map[b["asset"]] = b.get("locked", 0)
+
             if current_positions:
                 positions_block = "## 当前持仓\n"
                 for sym, pos in current_positions.items():
@@ -488,38 +452,65 @@ def _auto_trade_loop(interval):
                     except Exception:
                         cp = 0
                         pnl_pct = 0
+                    base = sym.replace("USDT", "")
+                    locked_amt = locked_map.get(base, 0)
+                    usdt_value = pos["quantity"] * cp if cp > 0 else 0
+                    is_dust = usdt_value < 2
+                    lock_tag = " [🔒冻结]" if locked_amt > 0 and pos.get("stop_order_id") else ""
+                    dust_tag = " [粉尘<2$]" if is_dust else ""
                     positions_block += (
-                        f"- {sym}: 入场价 {pos['entry_price']} 数量 {pos['quantity']} "
-                        f"止损 {pos.get('stop_loss', '-')} 止盈 {pos.get('take_profit', '-')} "
-                        f"当前 {cp} (盈亏 {pnl_pct:+.1f}%)\n"
+                        f"- {sym}: 入场{pos['entry_price']} 持仓{pos['quantity']}{lock_tag}{dust_tag} "
+                        f"止损{pos.get('stop_loss', '-')} 止盈{pos.get('take_profit', '-')} "
+                        f"现价{cp} (≈${usdt_value:.1f} 盈亏{pnl_pct:+.1f}%)\n"
                     )
+                    if is_dust:
+                        positions_block += f"  ⚠ 持仓<$2视为空仓，只能HOLD或BUY，禁止SELL\n"
+                    if locked_amt > 0 and pos.get("stop_order_id"):
+                        positions_block += f"  ⚠ OCO锁定中(约{locked_amt}个{base})，SELL前需先取消OCO\n"
             else:
-                positions_block = "## 当前持仓\n(空仓，无持仓)"
+                positions_block = "## 当前持仓\n(空仓，无持仓)\n"
 
-            # ===== Step 5: AI decision (Flash first, Pro on escalation) =====
-            _auto_state["status"] = f"第{rnd}轮: Flash 快速分析..."
-            _auto_broadcast("log", msg="🧠 Flash 快速决策中...")
-            used_model = "flash"
+            # Append open orders
+            if open_orders:
+                positions_block += "\n## 当前挂单\n"
+                for o in open_orders:
+                    otype = o.get("type", "?")
+                    sym = o.get("symbol", "?")
+                    side = o.get("side", "?")
+                    qty = float(o.get("origQty", 0))
+                    price = float(o.get("price", 0))
+                    stop = float(o.get("stopPrice", 0))
+                    status = o.get("status", "?")
+                    positions_block += f"- {sym} {side} {otype}: 数量{qty}"
+                    if stop > 0:
+                        positions_block += f" 触发价{stop}"
+                    if price > 0:
+                        positions_block += f" 限价{price}"
+                    positions_block += f" [{status}]\n"
+
+            # ===== Step 5: Flash 文字分析 → Pro JSON 决策 =====
             risk_rules, agg_profile, agg_level = _build_risk_rules(bal_result.get("totalCny", 0))
 
-            try:
-                analysis = _call_flash_decision(market_summary, search_context, positions_block, risk_rules=risk_rules)
-            except Exception as e:
-                _auto_broadcast("error", error=f"Flash 决策失败: {str(e)}")
-                raise
-
-            # Check if escalation to Pro is needed
-            if _should_escalate_to_pro(analysis):
-                _auto_state["status"] = f"第{rnd}轮: Pro 深度分析..."
-                _auto_broadcast("pro_start", msg="⚠ 触发升级条件 → DeepSeek Pro 深度分析中...")
-                try:
-                    analysis = _call_pro_decision_wrapper(market_summary, search_context, positions_block, risk_rules=risk_rules)
-                    used_model = "pro"
-                    _auto_broadcast("log", msg="✅ Pro 深度分析完成")
-                except Exception as e:
-                    _auto_broadcast("log", msg=f"⚠ Pro 调用失败, 使用 Flash 结果: {str(e)[:60]}")
+            # Flash: text analysis only (fast, cheap)
+            _auto_state["status"] = f"第{rnd}轮: Flash 分析..."
+            _auto_broadcast("log", msg="🧠 Flash 分析中...")
+            flash_text = _call_flash_analysis(market_summary, search_context, positions_block, risk_rules=risk_rules)
+            if flash_text:
+                _auto_broadcast("log", msg=f"📝 Flash: {flash_text[:150]}")
             else:
-                _auto_broadcast("log", msg="📋 Flash 决策足够 (无需Pro)")
+                _auto_broadcast("log", msg="⚠ Flash 无输出")
+
+            # Pro: always handles JSON decisions (with Flash's text analysis as extra context)
+            _auto_state["status"] = f"第{rnd}轮: Pro 决策..."
+            _auto_broadcast("pro_start", msg="🤖 Pro 决策中...")
+            try:
+                enriched = market_summary
+                if flash_text:
+                    enriched = market_summary + f"\n\n## Flash快速分析\n{flash_text}\n(以上为Flash分析，请结合数据做最终决策)"
+                analysis = _call_pro_decision_wrapper(enriched, search_context, positions_block, risk_rules=risk_rules)
+            except Exception as e:
+                _auto_broadcast("error", error=f"Pro 决策失败: {str(e)}")
+                raise
 
             decisions = analysis.get("decisions", [])
             enrich_decisions(decisions, market_data)
@@ -527,10 +518,28 @@ def _auto_trade_loop(interval):
             _auto_broadcast("decisions", decisions=decisions,
                           research_summary=analysis.get("research_summary", ""),
                           overall_analysis=analysis.get("overall_analysis", ""),
-                          model=used_model)
+                          model="pro")
 
             # ===== Step 6: Execute trades & track positions =====
             actionable = [d for d in decisions if d.get("action") in ("BUY", "SELL")
+                          and float(d.get("quantity", 0)) > 0]
+
+            # Enforce: skip SELL on dust positions (<$2)
+            for d in actionable:
+                if d.get("action") == "SELL":
+                    sym = d.get("symbol", "")
+                    qty = float(d.get("quantity", 0))
+                    try:
+                        cp = get_current_price(sym)
+                    except Exception:
+                        cp = 0
+                    if qty * cp < 2:
+                        _auto_broadcast("log", msg=f"  ⏭ {sym}: 持仓<$2(粉尘)，禁止SELL，强制HOLD")
+                        d["action"] = "HOLD"
+                        d["quantity"] = 0
+
+            # Re-filter after dust skip
+            actionable = [d for d in actionable if d.get("action") in ("BUY", "SELL")
                           and float(d.get("quantity", 0)) > 0]
 
             # Enforce: strip margin_short if aggressiveness doesn't allow
@@ -671,17 +680,97 @@ def _auto_trade_loop(interval):
                             "status": "exception", "error": str(e)[:100],
                         })
 
+            # ===== Step 6.5: Immediate fix for failed trades (no AI, just math) =====
+            failed = [e for e in exec_summary if e["status"] in ("failed", "exception")]
+            if failed:
+                for f in failed:
+                    sym = f["symbol"]
+                    act = f["action"]
+                    err = f.get("error", "")
+                    try:
+                        current_price = get_current_price(sym)
+                    except Exception:
+                        current_price = 0
+
+                    # Only fix min notional / insufficient balance errors with math
+                    if "低于最小" in err or "金额不足" in err or "insufficient" in err.lower():
+                        filters, sinfo = get_symbol_filters(sym)
+                        step_size_str = filters.get("LOT_SIZE", {}).get("stepSize", "0.00000001")
+                        step_size = float(step_size_str)
+                        min_qty = float(filters.get("LOT_SIZE", {}).get("minQty", "0"))
+                        min_notional = float(filters.get("MIN_NOTIONAL", {}).get("minNotional", "15"))
+                        prec = 0
+                        if "." in step_size_str:
+                            prec = len(step_size_str.split(".")[1].rstrip("0"))
+
+                        # Calculate minimum viable quantity
+                        min_qty_for_notional = min_notional / current_price if current_price > 0 else 0
+                        new_qty = round(max(min_qty_for_notional, min_qty, 0), prec)
+                        # Round up to step size if needed
+                        if step_size > 0 and new_qty % step_size != 0:
+                            new_qty = round(new_qty - (new_qty % step_size) + step_size, prec)
+
+                        if act == "SELL":
+                            base_asset = sinfo.get("baseAsset", sym.replace("USDT", ""))
+                            try:
+                                bal_data = get_account()
+                                free = 0.0
+                                locked = 0.0
+                                for b in bal_data.get("balances", []):
+                                    if b["asset"] == base_asset:
+                                        free = float(b["free"])
+                                        locked = float(b["locked"])
+                                        break
+                                # If locked by OCO, cancel first to free coins
+                                if free < new_qty and locked > 0:
+                                    pos = _auto_state.get("positions", {}).get(sym, {})
+                                    oid = pos.get("stop_order_id")
+                                    if oid:
+                                        try:
+                                            cancel_oco_order(sym, oid)
+                                        except Exception:
+                                            try:
+                                                cancel_order(sym, oid)
+                                            except Exception:
+                                                pass
+                                        try:
+                                            bal_data = get_account()
+                                            for b in bal_data.get("balances", []):
+                                                if b["asset"] == base_asset:
+                                                    free = float(b["free"])
+                                                    break
+                                        except Exception:
+                                            pass
+                                if free < new_qty:
+                                    new_qty = round(free, prec)
+                                break
+                            except Exception:
+                                pass
+
+                        if new_qty > 0 and new_qty * current_price >= min_notional:
+                            _auto_broadcast("log", msg=f"  🔧 自动修正: {act} {sym} qty→{new_qty} (≈${new_qty*current_price:.1f})")
+                            r = _execute_one_trade(sym, act, new_qty)
+                            if r.get("status") == "success":
+                                _auto_broadcast("log", msg=f"  ✅ 修正成功: {act} {sym}")
+                            else:
+                                _auto_broadcast("log", msg=f"  ⚠ 修正仍失败: {r.get('error', '?')}")
+                        else:
+                            _auto_broadcast("log", msg=f"  ⏭ {sym}: 余额不足以满足${min_notional}最低交易额")
+                    else:
+                        _auto_broadcast("log", msg=f"  ⏭ {sym}: 无法自动修正 ({err[:40]})")
+
             # Build execution feedback for next round's AI prompt
             if exec_summary:
                 lines = []
                 for r in exec_summary:
                     s = r["status"]
                     if s == "success":
-                        lines.append(f"✅ {r['action']} {r['symbol']}: 成交 ({r.get('mode', 'spot')})")
+                        lines.append(f"✅ {r['action']} {r['symbol']}: 成交")
                     elif s == "skipped":
-                        lines.append(f"⏭ {r['action']} {r['symbol']}: {r['error']}")
+                        lines.append(f"⏭ {r['action']} {r['symbol']}: {r['error']} → 请在本轮修正")
                     else:
-                        lines.append(f"❌ {r['action']} {r['symbol']}: {r['error']} (请调整策略)")
+                        lines.append(f"❌ {r['action']} {r['symbol']}: {r['error']} → 请按提示调整quantity或改为HOLD")
+                lines.append("(以上失败的交易请在本轮调整参数重试，不要忽略)")
                 _auto_state["last_execution"] = "\n".join(lines)
             else:
                 _auto_state["last_execution"] = "（本轮无交易）"
@@ -853,7 +942,7 @@ def _call_pro_decision(market_summary, search_context):
         {"role": "system", "content": DECISION_SYSTEM},
         {"role": "user", "content": decision_prompt},
     ])
-    return json.loads(strip_markdown_code(content))
+    return repair_json(strip_markdown_code(content))
 
 
 def _run_deepseek_analysis(market_data, balances):
@@ -877,7 +966,7 @@ def _execute_one_trade(symbol, action, quantity):
     step_size_str = filters.get("LOT_SIZE", {}).get("stepSize", "0.00000001")
     step_size = float(step_size_str)
     min_qty = float(filters.get("LOT_SIZE", {}).get("minQty", "0"))
-    min_notional = float(filters.get("MIN_NOTIONAL", {}).get("minNotional", "10"))
+    min_notional = float(filters.get("MIN_NOTIONAL", {}).get("minNotional", "15"))
 
     qty = float(quantity)
     prec = 0
@@ -891,18 +980,56 @@ def _execute_one_trade(symbol, action, quantity):
         current_price = 0
 
     if qty * current_price < min_notional:
+        need_qty = round(min_notional / current_price, prec + 1) if current_price > 0 else qty
         return {"symbol": symbol, "action": action, "status": "failed",
-                "error": f"金额 {qty * current_price:.2f} USDT 低于最小 {min_notional} USDT"}
+                "error": f"金额不足: {action} {qty}≈${qty*current_price:.2f} < 最低${min_notional}。请将quantity改为≥{need_qty}或HOLD"}
 
     if action == "SELL":
         base_asset = sinfo.get("baseAsset", symbol.replace("USDT", ""))
         bal_data = get_account()
+        free = 0.0
+        locked = 0.0
         for b in bal_data.get("balances", []):
             if b["asset"] == base_asset:
                 free = float(b["free"])
-                if free < qty:
-                    qty = round(free, prec)
+                locked = float(b["locked"])
                 break
+
+        # If coins are locked by OCO, cancel the order to free them
+        if free < qty and locked > 0:
+            pos = _auto_state.get("positions", {}).get(symbol, {})
+            oid = pos.get("stop_order_id")
+            if oid:
+                try:
+                    cancel_oco_order(symbol, oid)
+                    logger.info("🔓 自动取消OCO %s (ID:%s) 解锁 %s", symbol, oid, locked)
+                except Exception:
+                    try:
+                        cancel_order(symbol, oid)
+                    except Exception:
+                        pass
+                # Refresh balance after cancel
+                try:
+                    bal_data = get_account()
+                    for b in bal_data.get("balances", []):
+                        if b["asset"] == base_asset:
+                            free = float(b["free"])
+                            break
+                except Exception:
+                    pass
+
+        if free < qty:
+            qty = round(free, prec)
+        # If remaining after sell < $15, sell all (avoid dust)
+        remaining = free - qty
+        if 0 < remaining * current_price < min_notional:
+            import math
+            factor = 10 ** prec
+            qty = math.floor(free * factor) / factor
+            if qty <= 0:
+                qty = 0
+            else:
+                logger.info("📌 %s 清仓: qty=%s (剩余≈$%.2f<$%d)", symbol, qty, remaining * current_price, min_notional)
 
     if qty <= 0:
         return {"symbol": symbol, "action": action, "status": "skipped", "error": "余额不足"}
@@ -1068,7 +1195,7 @@ def _run_deepseek_analysis_stream(market_data, balances):
             {"role": "user", "content": decision_prompt},
         ])
         yield _sse({"event": "pro_done", "length": len(content)})
-        analysis = json.loads(strip_markdown_code(content))
+        analysis = repair_json(strip_markdown_code(content))
     except json.JSONDecodeError as e:
         yield _sse({"event": "error", "error": f"JSON 解析失败: {str(e)}"})
         return
