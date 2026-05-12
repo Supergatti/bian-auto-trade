@@ -32,7 +32,12 @@ def _public_request(endpoint, params=None):
         resp = requests.get(url, params=params or {}, timeout=30)
         elapsed = (time.time() - start) * 1000
         logger.debug("PUBLIC %s → %d (%dms)", endpoint, resp.status_code, int(elapsed))
-        resp.raise_for_status()
+        if not resp.ok:
+            body = resp.text[:300] if resp.text else "(empty)"
+            logger.error("Binance public API error %d: %s", resp.status_code, body)
+            raise requests.exceptions.HTTPError(
+                f"Binance {resp.status_code}: {body}", response=resp
+            )
         return resp.json()
     return _retry_api(_do, f"PUBLIC {endpoint}")
 
@@ -53,7 +58,12 @@ def _signed_request(method, endpoint, params=None):
             resp = requests.post(url, headers=headers, data=p, timeout=30)
         elapsed = (time.time() - start) * 1000
         logger.info("SIGNED %s %s → %d (%dms)", method, endpoint, resp.status_code, int(elapsed))
-        resp.raise_for_status()
+        if not resp.ok:
+            body = resp.text[:300] if resp.text else "(empty)"
+            logger.error("Binance API error %d: %s", resp.status_code, body)
+            raise requests.exceptions.HTTPError(
+                f"Binance {resp.status_code}: {body}", response=resp
+            )
         return resp.json()
     return _retry_api(_do, f"SIGNED {method} {endpoint}")
 

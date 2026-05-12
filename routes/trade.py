@@ -9,7 +9,7 @@ from flask import Blueprint, jsonify, request, Response, stream_with_context
 
 from config import (
     KLINE_INTERVALS, KLINE_LIMITS, MAX_WEB_SEARCH_ROUNDS,
-    DEEPSEEK_API_KEY, SEARCH_CACHE_FILE, logger,
+    DEEPSEEK_API_KEY, SEARCH_CACHE_FILE, AGGRESSIVENESS, logger,
 )
 from services.data_store import (
     load_trade_pairs, load_trade_history, save_trade_history,
@@ -54,6 +54,7 @@ _auto_state = {
     "decisions": [],
     "last_pnl": None,
     "positions": {},
+    "last_execution": "",
 }
 _auto_events = collections.deque(maxlen=500)
 _auto_lock = threading.Lock()
@@ -227,19 +228,105 @@ def _do_full_search(market_summary, pairs_str, depth="deep"):
     return search_context
 
 
-def _call_flash_decision(market_summary, search_context, positions_block):
-    """Call DeepSeek Flash for a quick trading decision."""
+def _get_aggressiveness_profile():
+    """Return (profile_dict, prompt_context) for the current aggressiveness level."""
+    levels = {
+        0: {"name": "保守", "cash_reserve": 0.50, "max_position": 0.10, "leverage": False,
+            "shorts": False, "style": "极少交易，持有现金为主，只在极度确定性下小仓位买入现货"},
+        1: {"name": "谨慎", "cash_reserve": 0.40, "max_position": 0.15, "leverage": False,
+            "shorts": False, "style": "精选交易，留足现金，只做现货买入，不做空"},
+        2: {"name": "稳健", "cash_reserve": 0.30, "max_position": 0.25, "leverage": False,
+            "shorts": True, "style": "适度交易，可以做空现货，不使用杠杆"},
+        3: {"name": "中性", "cash_reserve": 0.20, "max_position": 0.40, "leverage": True,
+            "shorts": True, "style": "积极交易，使用杠杆做空，中等仓位"},
+        4: {"name": "积极", "cash_reserve": 0.10, "max_position": 0.50, "leverage": True,
+            "shorts": True, "style": "激进交易，大仓位，主动做空，敢于重仓看好币种"},
+        5: {"name": "激进", "cash_reserve": 0.05, "max_position": 0.60, "leverage": True,
+            "shorts": True, "style": "YOLO模式，满仓操作，大幅杠杆做空，追求最高收益"},
+    }
+    lvl = max(0, min(5, AGGRESSIVENESS))
+    return levels[lvl], lvl
+
+
+def _build_risk_rules(total_cny=0):
+    """Build risk management rules including single-coin limit and aggressiveness."""
+    profile, lvl = _get_aggressiveness_profile()
+    usdt_rate = 7.25
+    total_usdt = round(total_cny / usdt_rate, 2) if total_cny > 0 else 300
+    max_per_coin = round(total_usdt * profile["max_position"], 2)
+    cash_keep = round(total_usdt * profile["cash_reserve"], 2)
+
+    rules = (
+        f"激进等级:{lvl}/5({profile['name']})。{profile['style']}。"
+        f"单币上限${max_per_coin} USDT(总资产{int(profile['max_position']*100)}%)。"
+        f"至少保留${cash_keep} USDT现金(总资产{int(profile['cash_reserve']*100)}%)。"
+    )
+    if profile["leverage"]:
+        rules += "允许margin_short杠杆做空。非常看好的币种可用杠杆。"
+    else:
+        rules += "禁止使用margin_short杠杆。只能现货卖出已有持仓。"
+    if not profile["shorts"]:
+        rules += "禁止做空。"
+
+    return rules, profile, lvl
+
+
+def _should_allow_margin_short():
+    """Check if current aggressiveness allows margin shorting."""
+    profile, _ = _get_aggressiveness_profile()
+    return profile["leverage"]
+
+
+def _get_max_position_pct():
+    """Get max position size as fraction of portfolio."""
+    profile, _ = _get_aggressiveness_profile()
+    return profile["max_position"]
+
+
+def _build_execution_context():
+    """Build a summary of last round's execution results for the AI."""
+    last = _auto_state.get("last_execution", "")
+    if last and last != "（本轮无交易）":
+        return f"## 上轮执行结果\n{last}\n(请根据以上结果调整本轮决策：失败的重试或调整参数，成功的确认持仓)"
+    return "## 上轮执行结果\n（首轮或上轮无交易）"
+
+
+def _call_flash_decision(market_summary, search_context, positions_block, max_retries=3, risk_rules=""):
+    """Call DeepSeek Flash for a quick trading decision. Retries on JSON parse failure."""
     search_section = f"## 联网搜索情报{search_context}" if search_context else "## 联网搜索情报\n(暂无搜索数据)"
     prompt = FLASH_DECISION_TEMPLATE.format(
         market_summary=market_summary,
         search_context=search_section,
         open_positions=positions_block,
+        risk_rules=risk_rules or _build_risk_rules()[0],
+        last_execution=_build_execution_context(),
     )
-    content = ask_flash([
-        {"role": "system", "content": FLASH_DECISION_SYSTEM},
-        {"role": "user", "content": prompt},
-    ], max_tokens=1024)
-    return json.loads(strip_markdown_code(content))
+    last_content = ""
+    for attempt in range(max_retries):
+        try:
+            content = ask_flash([
+                {"role": "system", "content": FLASH_DECISION_SYSTEM},
+                {"role": "user", "content": prompt},
+            ], max_tokens=1024)
+            last_content = content
+            return json.loads(strip_markdown_code(content))
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.warning("Flash JSON 解析失败 (attempt %d/%d): %s", attempt + 1, max_retries, str(e)[:80])
+            if attempt < max_retries - 1:
+                prompt = prompt + f"\n\n上次你返回的JSON格式错误({str(e)[:60]})。请严格返回合法JSON，不要加注释或多余文字。"
+                time.sleep(1)
+    # All retries exhausted — return HOLD for all pairs as safe fallback
+    logger.error("Flash JSON 全部重试失败，回退到全HOLD。最后输出: %s", last_content[:200])
+    _auto_broadcast("log", msg="⚠ Flash JSON连续解析失败，本轮全HOLD")
+    # Extract pair names from market summary
+    pairs = []
+    for line in market_summary.split("\n"):
+        if line.startswith("### "):
+            pairs.append(line.replace("### ", "").strip())
+    return {
+        "overall_analysis": "Flash JSON解析失败，全HOLD",
+        "decisions": [{"symbol": p, "trend": "震荡", "action": "HOLD", "quantity": 0, "reason": "模型异常", "estimatedUsdt": 0, "risk": "低"} for p in pairs],
+    }
 
 
 def _should_escalate_to_pro(flash_analysis):
@@ -271,13 +358,15 @@ def _should_escalate_to_pro(flash_analysis):
     return False
 
 
-def _call_pro_decision_wrapper(market_summary, search_context, positions_block):
-    """Call DeepSeek Pro for a final trading decision (same signature as _call_flash_decision)."""
+def _call_pro_decision_wrapper(market_summary, search_context, positions_block, risk_rules=""):
+    """Call DeepSeek Pro for a final trading decision."""
     search_section = f"## 联网搜索情报{search_context}" if search_context else "## 联网搜索情报\n(暂无搜索数据)"
     prompt = DECISION_TEMPLATE.format(
         market_summary=market_summary,
         search_context=search_section,
         open_positions=positions_block,
+        risk_rules=risk_rules or _build_risk_rules()[0],
+        last_execution=_build_execution_context(),
     )
     content = ask_pro([
         {"role": "system", "content": DECISION_SYSTEM},
@@ -411,9 +500,10 @@ def _auto_trade_loop(interval):
             _auto_state["status"] = f"第{rnd}轮: Flash 快速分析..."
             _auto_broadcast("log", msg="🧠 Flash 快速决策中...")
             used_model = "flash"
+            risk_rules, agg_profile, agg_level = _build_risk_rules(bal_result.get("totalCny", 0))
 
             try:
-                analysis = _call_flash_decision(market_summary, search_context, positions_block)
+                analysis = _call_flash_decision(market_summary, search_context, positions_block, risk_rules=risk_rules)
             except Exception as e:
                 _auto_broadcast("error", error=f"Flash 决策失败: {str(e)}")
                 raise
@@ -423,7 +513,7 @@ def _auto_trade_loop(interval):
                 _auto_state["status"] = f"第{rnd}轮: Pro 深度分析..."
                 _auto_broadcast("pro_start", msg="⚠ 触发升级条件 → DeepSeek Pro 深度分析中...")
                 try:
-                    analysis = _call_pro_decision_wrapper(market_summary, search_context, positions_block)
+                    analysis = _call_pro_decision_wrapper(market_summary, search_context, positions_block, risk_rules=risk_rules)
                     used_model = "pro"
                     _auto_broadcast("log", msg="✅ Pro 深度分析完成")
                 except Exception as e:
@@ -442,6 +532,35 @@ def _auto_trade_loop(interval):
             # ===== Step 6: Execute trades & track positions =====
             actionable = [d for d in decisions if d.get("action") in ("BUY", "SELL")
                           and float(d.get("quantity", 0)) > 0]
+
+            # Enforce: strip margin_short if aggressiveness doesn't allow
+            if not _should_allow_margin_short():
+                for d in actionable:
+                    if d.get("mode") == "margin_short":
+                        _auto_broadcast("log", msg=f"  🔒 {d['symbol']}: margin_short被禁止(激进等级{agg_level}), 转为现货SELL")
+                        d["mode"] = "spot"
+
+            # Enforce cash reserve & position limits
+            max_pos_pct = _get_max_position_pct()
+            _, profile, _ = _build_risk_rules(bal_result.get("totalCny", 0))
+            cash_reserve = profile["cash_reserve"]
+            if actionable:
+                # Calculate available USDT (keep cash reserve)
+                usdt_bal = 0
+                for b in bal_list:
+                    if b["asset"] == "USDT":
+                        usdt_bal = b["free"]
+                max_spend = max(0, usdt_bal - (usdt_bal * cash_reserve))
+                total_buy_est = sum(float(d.get("estimatedUsdt", 0)) for d in actionable if d.get("action") == "BUY")
+                if total_buy_est > max_spend and max_spend > 0:
+                    scale = max_spend / total_buy_est if total_buy_est > 0 else 1
+                    _auto_broadcast("log", msg=f"💰 现金储备: 保留${usdt_bal * cash_reserve:.0f}({int(cash_reserve*100)}%), 可用${max_spend:.0f}, 买入需求${total_buy_est:.0f}, 缩放{scale:.1%}")
+                    for d in actionable:
+                        if d.get("action") == "BUY":
+                            d["quantity"] = round(float(d.get("quantity", 0)) * scale, 8)
+                            d["estimatedUsdt"] = round(float(d.get("estimatedUsdt", 0)) * scale, 2)
+
+            exec_summary = []
             if actionable:
                 _auto_broadcast("log", msg=f"💱 执行 {len(actionable)} 笔交易...")
                 for d in actionable:
@@ -539,10 +658,33 @@ def _auto_trade_loop(interval):
                                     _auto_broadcast("log", msg=f"  📌 平仓空头 {sym}")
                         else:
                             _auto_broadcast("log", msg=f"  ⚠ {act} {sym}: {r.get('error', '?')}")
+                        # Collect execution result for AI feedback
+                        exec_summary.append({
+                            "symbol": sym, "action": act, "mode": mode,
+                            "status": r.get("status", "?"),
+                            "error": r.get("error", ""),
+                        })
                     except Exception as e:
                         _auto_broadcast("log", msg=f"  ❌ {act} {sym}: {str(e)[:80]}")
+                        exec_summary.append({
+                            "symbol": sym, "action": act, "mode": mode,
+                            "status": "exception", "error": str(e)[:100],
+                        })
+
+            # Build execution feedback for next round's AI prompt
+            if exec_summary:
+                lines = []
+                for r in exec_summary:
+                    s = r["status"]
+                    if s == "success":
+                        lines.append(f"✅ {r['action']} {r['symbol']}: 成交 ({r.get('mode', 'spot')})")
+                    elif s == "skipped":
+                        lines.append(f"⏭ {r['action']} {r['symbol']}: {r['error']}")
+                    else:
+                        lines.append(f"❌ {r['action']} {r['symbol']}: {r['error']} (请调整策略)")
+                _auto_state["last_execution"] = "\n".join(lines)
             else:
-                _auto_broadcast("log", msg="📊 本轮无交易建议 (全部 HOLD)")
+                _auto_state["last_execution"] = "（本轮无交易）"
 
             # ===== Step 7: Update PnL =====
             pnl = _calculate_pnl(load_trade_history())
@@ -703,6 +845,8 @@ def _call_pro_decision(market_summary, search_context):
         market_summary=market_summary,
         search_context=search_section,
         open_positions="(手动分析模式，无持仓追踪)",
+        risk_rules="单币≤$120 USDT(总资产40%)。",
+        last_execution="（手动分析模式）",
     )
 
     content = ask_pro([
@@ -916,6 +1060,8 @@ def _run_deepseek_analysis_stream(market_data, balances):
             market_summary=market_summary,
             search_context=search_section,
             open_positions="(手动分析模式，无持仓追踪)",
+            risk_rules="单币≤$120 USDT(总资产40%)。",
+            last_execution="（手动分析模式）",
         )
         content = ask_pro([
             {"role": "system", "content": DECISION_SYSTEM},
