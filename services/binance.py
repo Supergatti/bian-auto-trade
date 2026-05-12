@@ -176,6 +176,53 @@ def margin_order(symbol, side, quantity):
     return _signed_request("POST", "/sapi/v1/margin/order", params)
 
 
+def stop_loss_order(symbol, quantity, stop_price):
+    """Place a STOP_LOSS market order (triggers market sell when stopPrice is hit)."""
+    params = {
+        "symbol": symbol, "side": "SELL", "type": "STOP_LOSS",
+        "quantity": str(quantity), "stopPrice": str(stop_price),
+    }
+    return _signed_request("POST", "/api/v3/order", params)
+
+
+def oco_order(symbol, quantity, stop_price, take_profit_price):
+    """Place an OCO (one-cancels-other) order: stop-loss + limit take-profit.
+    When one triggers, the other is automatically cancelled."""
+    stop_limit_price = round(stop_price * 0.998, 2)  # slightly below stop for execution
+    params = {
+        "symbol": symbol,
+        "side": "SELL",
+        "quantity": str(quantity),
+        "price": str(take_profit_price),  # limit price for take-profit
+        "stopPrice": str(stop_price),  # stop trigger
+        "stopLimitPrice": str(stop_limit_price),  # limit price after stop triggers
+        "stopLimitTimeInForce": "GTC",
+    }
+    return _signed_request("POST", "/api/v3/order/oco", params)
+
+
+def cancel_order(symbol, order_id):
+    """Cancel an open order by ID."""
+    return _signed_request("DELETE", "/api/v3/order", {
+        "symbol": symbol, "orderId": order_id,
+    })
+
+
+def cancel_oco_order(symbol, order_list_id):
+    """Cancel an OCO (one-cancels-other) order by orderListId."""
+    return _signed_request("DELETE", "/api/v3/orderList", {
+        "symbol": symbol, "orderListId": order_list_id,
+    })
+
+
+def get_open_orders(symbol=None):
+    """Get all open orders, optionally filtered by symbol."""
+    params = {}
+    if symbol:
+        params["symbol"] = symbol
+    return _signed_request("GET", "/api/v3/openOrders", params or None)
+
+
 def get_depth(symbol, limit=10):
     data = _public_request("/api/v3/depth", {"symbol": symbol.upper(), "limit": limit})
     return {

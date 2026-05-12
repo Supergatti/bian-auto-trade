@@ -24,6 +24,7 @@ FAVORITES_FILE = os.path.join(DATA_DIR, "favorites.json")
 TRADE_HISTORY_FILE = os.path.join(DATA_DIR, "trade_history.json")
 POSITIONS_FILE = os.path.join(DATA_DIR, "positions.json")
 BALANCE_HISTORY_FILE = os.path.join(DATA_DIR, "balance_history.json")
+SEARCH_CACHE_FILE = os.path.join(DATA_DIR, "search_cache.json")
 
 TOP_HOT_PAIRS = [
     "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",

@@ -58,10 +58,11 @@ DECISION_TEMPLATE = """你是一个专业的加密货币量化交易分析师。
 - 如果已有持仓，优先考虑持仓管理（是否加仓/减仓/清仓），而非开新仓
 - 当某币种24h涨跌幅超过 ±10%，请特别警惕并评估是否触发止盈或止损
 - SELL 不只是平仓，也可以在趋势明显转空时主动做空（卖出你持有的币种，等更低价格再买回赚取差价）
-- 根据技术分析积极判断趋势方向：上升趋势优先BUY，下降趋势优先SELL，震荡市优先HOLD"""
+- 根据技术分析积极判断趋势方向：上升趋势优先BUY，下降趋势优先SELL，震荡市优先HOLD
+- mode=spot为现货交易，mode=margin_short为杠杆借币做空。做空时 action=SELL 开空，action=BUY 平空"""
 
 # Flash decision prompt — used for routine rounds (cheaper/faster)
-FLASH_DECISION_SYSTEM = "你是加密货币快速交易分析师。返回纯JSON，简洁直接。做空=卖出持有的币等低价买回。"
+FLASH_DECISION_SYSTEM = "你是加密货币快速交易分析师。返回纯JSON。趋势下跌时大胆做空(margin_short+SELL)，别只观望。"
 
 FLASH_DECISION_TEMPLATE = """快速分析市场数据给出交易建议。返回纯JSON（不含markdown）。
 
@@ -75,8 +76,12 @@ FLASH_DECISION_TEMPLATE = """快速分析市场数据给出交易建议。返回
 {{
   "overall_analysis": "一句话总结市场",
   "decisions": [
-    {{"symbol":"BTCUSDT","trend":"上升/下降/震荡","action":"BUY/SELL/HOLD","quantity":0,"reason":"理由10字内","estimatedUsdt":0,"stopLossPrice":0,"takeProfitPrice":0,"risk":"低/中/高"}}
+    {{"symbol":"BTCUSDT","trend":"上升/下降/震荡","action":"BUY/SELL/HOLD","quantity":0,"reason":"理由10字内","estimatedUsdt":0,"stopLossPrice":0,"takeProfitPrice":0,"risk":"低/中/高","mode":"spot"}}
   ]
 }}
 
-规则：BUY时必须给stopLossPrice和takeProfitPrice。SELL=卖出持仓做空。HOLD时quantity=0。每个交易对都要给决策。"""
+重要规则：
+- 趋势上升→BUY现货。趋势下降→大胆SELL做空(mode=margin_short)。震荡→HOLD
+- BUY必须给stopLossPrice+takeProfitPrice
+- margin_short+SELL=开空，margin_short+BUY=平空（要设止损止盈）
+- 每个交易对都要给决策。别全HOLD，趋势明确就动手"""

@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from config import TAVILY_API_KEY, logger
 
 
-def _search_tavily(query, num_results=5):
+def _search_tavily(query, num_results=10):
     """Search via Tavily API (AI-optimized search)."""
     results = []
     try:
@@ -14,7 +14,7 @@ def _search_tavily(query, num_results=5):
                 "api_key": TAVILY_API_KEY,
                 "query": query,
                 "search_depth": "advanced",
-                "max_results": num_results,
+                "max_results": max(num_results, 10),
                 "include_answer": True,
             },
             timeout=15,

@@ -9,7 +9,7 @@ from flask import Blueprint, jsonify, request, Response, stream_with_context
 
 from config import (
     KLINE_INTERVALS, KLINE_LIMITS, MAX_WEB_SEARCH_ROUNDS,
-    DEEPSEEK_API_KEY, logger,
+    DEEPSEEK_API_KEY, SEARCH_CACHE_FILE, logger,
 )
 from services.data_store import (
     load_trade_pairs, load_trade_history, save_trade_history,
@@ -22,6 +22,7 @@ from services.binance import (
     get_symbol_filters, get_current_price, execute_order,
     collect_pair_data, _public_request,
     margin_account, margin_max_borrowable, margin_borrow, margin_repay, margin_order,
+    stop_loss_order, oco_order, cancel_order, cancel_oco_order, get_open_orders,
 )
 from services.deepseek import ask_flash, ask_pro
 from services.web_search import search_web
@@ -109,6 +110,16 @@ def _check_positions(market_data):
                 r = _execute_one_trade(symbol, "SELL", qty)
                 trade_info = r.get("trade", {})
                 if r.get("status") == "success":
+                    # Cancel the exchange OCO/stop-loss order
+                    oid = pos.get("stop_order_id")
+                    if oid:
+                        try:
+                            cancel_oco_order(symbol, oid)
+                        except Exception:
+                            try:
+                                cancel_order(symbol, oid)
+                            except Exception:
+                                pass
                     _auto_broadcast("log", msg=f"  ✅ 自动平仓 {symbol} x {qty} @ {current_price}")
                     _auto_broadcast("trade_result", symbol=symbol, action="SELL",
                                   status="success", price=current_price, quantity=qty,
@@ -124,61 +135,94 @@ def _check_positions(market_data):
     return exits
 
 
-def _do_full_search(market_summary, pairs_str):
-    """Single-round search: Flash suggests queries → parallel Tavily → one summary.
-    LLM calls: 2 (direction + summary). Tavily calls: up to 5 (parallel)."""
+def _load_search_cache():
+    """Load persisted search results from disk."""
+    cache = load_json(SEARCH_CACHE_FILE, dict)
+    return cache
+
+
+def _save_search_cache(search_context):
+    """Persist search results to disk."""
+    cache = {
+        "last_search_time": time.time(),
+        "search_context": search_context,
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    save_json(SEARCH_CACHE_FILE, cache)
+
+
+def _do_full_search(market_summary, pairs_str, depth="deep"):
+    """Tiered search: deep=2 rounds+6 queries each, light=1 round 2-3 news queries.
+    Returns accumulated search_context string."""
     search_context = ""
 
-    # Step 1: Flash suggests what to search (1 LLM call)
-    q_prompt = SEARCH_TEMPLATE.format(market_summary=market_summary, pairs_str=pairs_str)
-    _auto_broadcast("search_round", round=1, status="asking")
+    if depth == "deep":
+        rounds = 2
+        queries_per_round = 6
+        results_per_query = 12
+        _auto_broadcast("log", msg="🔬 深度搜索模式: 2轮 × 6查询")
+    elif depth == "medium":
+        rounds = 1
+        queries_per_round = 4
+        results_per_query = 12
+        _auto_broadcast("log", msg="📡 中等搜索模式: 1轮 × 4查询")
+    else:  # light
+        rounds = 1
+        queries_per_round = 3
+        results_per_query = 12
+        _auto_broadcast("log", msg="📰 轻量搜索模式: 1轮 × 3条新闻查询")
 
-    try:
-        flash_resp = ask_flash([
-            {"role": "system", "content": SEARCH_SYSTEM},
-            {"role": "user", "content": q_prompt},
-        ], max_tokens=512)
-    except Exception as e:
-        _auto_broadcast("log", msg=f"⚠ Flash 搜索方向失败: {str(e)[:80]}")
-        return search_context
+    for sr in range(rounds):
+        q_prompt = SEARCH_TEMPLATE.format(market_summary=market_summary, pairs_str=pairs_str)
+        _auto_broadcast("search_round", round=sr + 1, status="asking")
 
-    searches = parse_flash_search_response(flash_resp)
-    if not searches:
-        _auto_broadcast("log", msg="📋 Flash 判断无需搜索")
-        return search_context
+        try:
+            flash_resp = ask_flash([
+                {"role": "system", "content": SEARCH_SYSTEM},
+                {"role": "user", "content": q_prompt},
+            ], max_tokens=512)
+        except Exception as e:
+            _auto_broadcast("log", msg=f"⚠ Flash 搜索方向失败: {str(e)[:80]}")
+            break
 
-    _auto_broadcast("search_query", round=1, queries=searches)
+        searches = parse_flash_search_response(flash_resp)
+        if not searches:
+            _auto_broadcast("log", msg="📋 Flash 判断无需搜索")
+            break
 
-    # Step 2: Parallel Tavily searches (up to 5, all at once)
-    all_results = []
-    with ThreadPoolExecutor(max_workers=min(len(searches), 5)) as pool:
-        futures = {pool.submit(search_web, q, 4): q for q in searches[:5]}
-        for future in as_completed(futures):
-            query = futures[future]
+        _auto_broadcast("search_query", round=sr + 1, queries=searches)
+
+        all_results = []
+        with ThreadPoolExecutor(max_workers=min(len(searches), queries_per_round)) as pool:
+            futures = {pool.submit(search_web, q, results_per_query): q for q in searches[:queries_per_round]}
+            for future in as_completed(futures):
+                query = futures[future]
+                try:
+                    results = future.result()
+                    all_results.extend(results)
+                    _auto_broadcast("search_found", round=sr + 1, query=query, count=len(results))
+                except Exception as e:
+                    _auto_broadcast("log", msg=f"  ⚠ 搜索 '{query[:30]}' 失败: {str(e)[:60]}")
+
+        if all_results:
+            results_text = "\n---\n".join(f"[{r['title']}] {r['snippet']}" for r in all_results[:15])
             try:
-                results = future.result()
-                all_results.extend(results)
-                _auto_broadcast("search_found", round=1, query=query, count=len(results))
+                summary = ask_flash([
+                    {"role": "system", "content": SUMMARIZE_SYSTEM},
+                    {"role": "user", "content": SUMMARIZE_TEMPLATE.format(results_text=results_text)},
+                ], max_tokens=512)
+                search_context += f"\n## 第{sr + 1}轮\n{summary}\n"
+                _auto_broadcast("search_summary", round=sr + 1, summary=summary)
             except Exception as e:
-                _auto_broadcast("log", msg=f"  ⚠ 搜索 '{query[:30]}' 失败: {str(e)[:60]}")
+                _auto_broadcast("log", msg=f"⚠ 总结失败: {str(e)[:80]}")
 
-    if not all_results:
-        _auto_broadcast("log", msg="📋 所有搜索无结果")
-        return search_context
-
-    # Step 3: Flash summarizes all results in one go (1 LLM call)
-    results_text = "\n---\n".join(
-        f"[{r['title']}] {r['snippet']}" for r in all_results[:15]
-    )
-    try:
-        summary = ask_flash([
-            {"role": "system", "content": SUMMARIZE_SYSTEM},
-            {"role": "user", "content": SUMMARIZE_TEMPLATE.format(results_text=results_text)},
-        ], max_tokens=512)
-        search_context = f"\n{summary}\n"
-        _auto_broadcast("search_summary", round=1, summary=summary)
-    except Exception as e:
-        _auto_broadcast("log", msg=f"⚠ 总结失败: {str(e)[:80]}")
+    # Persist to disk
+    if search_context:
+        try:
+            _save_search_cache(search_context)
+            _auto_broadcast("log", msg="💾 搜索情报已持久化到磁盘")
+        except Exception:
+            pass
 
     return search_context
 
@@ -303,7 +347,7 @@ def _auto_trade_loop(interval):
             ])
             _auto_broadcast("log", msg=f"💰 总资产约 ¥{bal_result['totalCny']:.2f}")
 
-            # ===== Step 3: Search (only every 2 hours) =====
+            # ===== Step 3: Search (tiered: first round deep, later light) =====
             market_summary = _make_market_summary(market_data, bal_list)
             pairs_str = ", ".join(market_data.keys())
 
@@ -312,10 +356,28 @@ def _auto_trade_loop(interval):
             last_search = _auto_state.get("last_search_time", 0)
             need_search = (now_ts - last_search) >= search_interval
 
+            # Load disk cache if in-memory cache is empty (app restart)
+            if not _auto_state.get("cached_search_context"):
+                disk_cache = _load_search_cache()
+                if disk_cache.get("search_context"):
+                    _auto_state["cached_search_context"] = disk_cache["search_context"]
+                    _auto_state["last_search_time"] = disk_cache.get("last_search_time", 0)
+                    _auto_broadcast("log", msg=f"💾 从磁盘加载搜索缓存 ({disk_cache.get('updated_at', '?')})")
+
             if need_search:
                 _auto_state["status"] = f"第{rnd}轮: 联网搜索中..."
-                _auto_broadcast("log", msg="🌐 触发联网搜索 (距上次搜索超过2小时)")
-                search_context = _do_full_search(market_summary, pairs_str)
+
+                # Determine search depth
+                hours_since_last = (now_ts - max(last_search, _auto_state.get("last_search_time", 0))) / 3600
+                if last_search == 0 or hours_since_last > 24:
+                    depth = "deep"
+                elif hours_since_last > 6:
+                    depth = "medium"
+                else:
+                    depth = "light"
+
+                _auto_broadcast("log", msg=f"🌐 触发搜索 (距上次 {hours_since_last:.0f}h, {depth}模式)")
+                search_context = _do_full_search(market_summary, pairs_str, depth)
                 _auto_state["last_search_time"] = now_ts
                 _auto_state["cached_search_context"] = search_context
             else:
@@ -323,7 +385,7 @@ def _auto_trade_loop(interval):
                 since = int((now_ts - last_search) // 60)
                 _auto_broadcast("log", msg=f"📋 使用缓存搜索情报 (上次搜索 {since} 分钟前)")
                 if search_context:
-                    _auto_broadcast("log", msg=f"📋 缓存内容: {search_context[:120]}...")
+                    _auto_broadcast("log", msg=f"📋 缓存概要: {search_context[:150]}...")
 
             # ===== Step 4: Build open positions summary for Pro =====
             positions_block = ""
@@ -386,13 +448,22 @@ def _auto_trade_loop(interval):
                     sym = d.get("symbol", "").upper().strip()
                     act = d.get("action", "").upper().strip()
                     qty = float(d.get("quantity", 0))
+                    mode = d.get("mode", "spot").strip()
+
                     try:
-                        r = _execute_one_trade(sym, act, qty)
+                        if mode == "margin_short":
+                            if act == "SELL":
+                                r = _execute_margin_short(sym, qty)
+                            else:  # BUY to cover short
+                                r = _execute_margin_cover(sym, qty)
+                        else:
+                            r = _execute_one_trade(sym, act, qty)
+
                         trade_info = r.get("trade", {})
                         exec_price = trade_info.get("price", 0)
                         exec_qty = trade_info.get("quantity", qty)
                         _auto_broadcast("trade_result", symbol=sym, action=act,
-                                      status=r.get("status", "?"),
+                                      status=r.get("status", "?"), mode=mode,
                                       price=exec_price if r.get("status") == "success" else 0,
                                       quantity=exec_qty,
                                       error=r.get("error", ""))
@@ -400,24 +471,72 @@ def _auto_trade_loop(interval):
                         if r.get("status") == "success":
                             _auto_broadcast("log", msg=f"  ✅ {act} {sym} {exec_qty} @ {exec_price}")
 
-                            # Track new BUY position with stop-loss and take-profit
-                            if act == "BUY":
+                            # Track long positions (spot BUY) + place OCO (stop-loss + take-profit) on Binance
+                            if mode != "margin_short" and act == "BUY":
                                 sl = float(d.get("stopLossPrice", 0))
                                 tp = float(d.get("takeProfitPrice", 0))
+                                oco_order_id = None
+                                # Place OCO: stop-loss + take-profit on exchange
+                                if sl > 0 and tp > 0:
+                                    try:
+                                        oco_resp = oco_order(sym, exec_qty, sl, tp)
+                                        # OCO response contains an orderListId and list of orders
+                                        oco_order_id = oco_resp.get("orderListId")
+                                        _auto_broadcast("log", msg=f"  🎯 OCO已挂: {sym} 止损@{sl} 止盈@{tp} (ID:{oco_order_id})")
+                                    except Exception as e:
+                                        _auto_broadcast("log", msg=f"  ⚠ OCO挂单失败: {str(e)[:80]}")
+                                elif sl > 0:
+                                    try:
+                                        sl_resp = stop_loss_order(sym, exec_qty, sl)
+                                        oco_order_id = sl_resp.get("orderId")
+                                        _auto_broadcast("log", msg=f"  🛡 止损单已挂: {sym} 止损@{sl}")
+                                    except Exception as e:
+                                        _auto_broadcast("log", msg=f"  ⚠ 止损挂单失败: {str(e)[:80]}")
                                 _auto_state["positions"][sym] = {
                                     "entry_price": exec_price,
                                     "quantity": exec_qty,
                                     "stop_loss": sl,
                                     "take_profit": tp,
+                                    "mode": "spot",
+                                    "stop_order_id": oco_order_id,
                                     "entry_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                                 }
-                                _auto_broadcast("log", msg=f"  📌 跟踪持仓 {sym}: 止损 {sl} 止盈 {tp}")
+                                _auto_broadcast("log", msg=f"  📌 跟踪持仓 {sym}: 止损@{sl} 止盈@{tp}")
 
-                            # Remove from tracking when SELL succeeds
-                            elif act == "SELL":
+                            # Track short positions (margin SELL)
+                            elif mode == "margin_short" and act == "SELL":
+                                sl = float(d.get("stopLossPrice", 0))
+                                tp = float(d.get("takeProfitPrice", 0))
+                                _auto_state["positions"][sym] = {
+                                    "entry_price": exec_price,
+                                    "quantity": r.get("borrowed", exec_qty),
+                                    "stop_loss": sl,
+                                    "take_profit": tp,
+                                    "mode": "margin_short",
+                                    "entry_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                }
+                                _auto_broadcast("log", msg=f"  📌 跟踪空头 {sym}: 止损 {sl} 止盈 {tp}")
+
+                            # Remove position tracking + cancel stop-loss order
+                            elif act == "SELL" and mode != "margin_short":
                                 if sym in _auto_state["positions"]:
+                                    pos = _auto_state["positions"][sym]
+                                    oid = pos.get("stop_order_id")
+                                    if oid:
+                                        try:
+                                            cancel_oco_order(sym, oid)
+                                        except Exception:
+                                            try:
+                                                cancel_order(sym, oid)
+                                            except Exception:
+                                                pass
+                                        _auto_broadcast("log", msg=f"  🛡 已取消OCO/止损单 {sym} (ID:{oid})")
                                     del _auto_state["positions"][sym]
                                     _auto_broadcast("log", msg=f"  📌 移除持仓 {sym}")
+                            elif mode == "margin_short" and act == "BUY":
+                                if sym in _auto_state["positions"]:
+                                    del _auto_state["positions"][sym]
+                                    _auto_broadcast("log", msg=f"  📌 平仓空头 {sym}")
                         else:
                             _auto_broadcast("log", msg=f"  ⚠ {act} {sym}: {r.get('error', '?')}")
                     except Exception as e:
@@ -554,8 +673,8 @@ def _search_loop(market_summary, pairs_str):
 
     # Parallel search
     all_results = []
-    with ThreadPoolExecutor(max_workers=min(len(searches), 5)) as pool:
-        futures = {pool.submit(search_web, q, 3): q for q in searches[:5]}
+    with ThreadPoolExecutor(max_workers=min(len(searches), 6)) as pool:
+        futures = {pool.submit(search_web, q, 8): q for q in searches[:6]}
         for future in as_completed(futures):
             query = futures[future]
             try:
@@ -762,8 +881,8 @@ def _run_deepseek_analysis_stream(market_data, balances):
 
         # Parallel search
         all_results = []
-        with ThreadPoolExecutor(max_workers=min(len(searches), 5)) as pool:
-            futures = {pool.submit(search_web, q, 3): q for q in searches[:5]}
+        with ThreadPoolExecutor(max_workers=min(len(searches), 6)) as pool:
+            futures = {pool.submit(search_web, q, 8): q for q in searches[:6]}
             for future in as_completed(futures):
                 query = futures[future]
                 try:
@@ -983,6 +1102,29 @@ def trade_history():
     return jsonify({"trades": load_trade_history(), "pnl": _calculate_pnl(load_trade_history())})
 
 
+@trade_bp.route("/api/trade/open-orders")
+def open_orders():
+    try:
+        orders = get_open_orders()
+        result = []
+        for o in orders:
+            result.append({
+                "orderId": o.get("orderId"),
+                "symbol": o.get("symbol"),
+                "type": o.get("type"),
+                "side": o.get("side"),
+                "price": float(o.get("price", 0)),
+                "stopPrice": float(o.get("stopPrice", 0)),
+                "origQty": float(o.get("origQty", 0)),
+                "executedQty": float(o.get("executedQty", 0)),
+                "status": o.get("status"),
+                "time": o.get("time"),
+            })
+        return jsonify({"orders": result})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @trade_bp.route("/api/trade/positions")
 def positions():
     records = load_trade_history()
@@ -1037,8 +1179,15 @@ def auto_trade_start():
     _auto_state["decisions"] = []
     _auto_state["last_pnl"] = None
     _auto_state["last_time"] = None
-    _auto_state["last_search_time"] = 0
-    _auto_state["cached_search_context"] = ""
+    # Load persisted search cache from disk (survives restarts)
+    disk_cache = _load_search_cache()
+    if disk_cache.get("search_context"):
+        _auto_state["last_search_time"] = disk_cache.get("last_search_time", 0)
+        _auto_state["cached_search_context"] = disk_cache["search_context"]
+        logger.info("💾 从磁盘加载搜索缓存 (%s)", disk_cache.get("updated_at", "?"))
+    else:
+        _auto_state["last_search_time"] = 0
+        _auto_state["cached_search_context"] = ""
     _auto_state["positions"] = {}
 
     with _auto_lock:

@@ -372,6 +372,8 @@
             </div>
             <div class="trade-section-title">📋 交易记录</div>
             <div class="table-wrap" id="tradeLogTable"></div>
+            <div class="trade-section-title">📝 挂单 <span id="openOrdersCount" style="font-size:11px;color:#888;font-weight:normal;"></span></div>
+            <div class="table-wrap" id="openOrdersTable"></div>
             <div class="trade-section-title">📊 盈亏汇总</div>
             <div class="table-wrap" id="tradePnlTable"></div>
         </div>
@@ -830,7 +832,7 @@
             } catch (e) {
                 // ignore
             }
-            await loadTradeHistory();
+            await Promise.all([loadTradeHistory(), loadOpenOrders()]);
         }
 
         function updateAutoUI(running) {
@@ -922,17 +924,19 @@
             const rows = Object.entries(positions).map(([sym, pos]) => {
                 const sl = pos.stop_loss ? `$${fmtNum(pos.stop_loss)}` : "-";
                 const tp = pos.take_profit ? `$${fmtNum(pos.take_profit)}` : "-";
+                const isShort = pos.mode === "margin_short";
+                const modeTag = isShort ? '<span style="color:#e74c3c;font-size:10px;">做空</span>' : '<span style="color:#00d4aa;font-size:10px;">现货</span>';
                 return `<tr>
-                    <td><span class="asset-name">${sym}</span></td>
+                    <td><span class="asset-name">${sym}</span> ${modeTag}</td>
                     <td class="mono">${fmtNum(pos.quantity)}</td>
-                    <td class="mono">$${fmtNum(pos.entry_price)}</td>
+                    <td class="mono" style="color:${isShort?'#e74c3c':'#ccc'};">$${fmtNum(pos.entry_price)}</td>
                     <td class="mono" style="color:#e74c3c;">${sl}</td>
                     <td class="mono" style="color:#00d4aa;">${tp}</td>
                     <td>${pos.entry_time || "-"}</td>
                 </tr>`;
             }).join("");
             tbl.innerHTML = `<table>
-                <thead><tr><th>交易对</th><th>数量</th><th>入场价</th><th>止损价</th><th>止盈价</th><th>入场时间</th></tr></thead>
+                <thead><tr><th>交易对</th><th>数量</th><th>入场价</th><th>止损</th><th>止盈</th><th>入场时间</th></tr></thead>
                 <tbody>${rows}</tbody>
             </table>`;
         }
@@ -1007,7 +1011,7 @@
                 document.getElementById("autoStatusTag").textContent = `等待 ${Math.floor((evt.next_round_in||0)/60)} 分钟...`;
                 document.getElementById("autoLastTime").textContent = nowStr();
                 renderPositionsTable(evt.positions || {});
-                loadTradeHistory();
+                loadTradeHistory(); loadOpenOrders();
             } else if (e === "waiting") {
                 document.getElementById("autoStatusTag").textContent = `等待中... ${Math.floor((evt.remaining||0)/60)}分${(evt.remaining||0)%60}秒`;
             } else if (e === "auto_stopping") {
@@ -1309,7 +1313,7 @@
             } catch (err) {
                 addAutoLog(`❌ 执行失败: ${err.message}`, "#e74c3c");
             }
-            await loadTradeHistory();
+            await Promise.all([loadTradeHistory(), loadOpenOrders()]);
         }
 
         function renderDecisionCard(d) {
@@ -1334,6 +1338,40 @@
                 <div style="color:#aaa;font-size:12px;">${d.reason || ""}</div>
                 ${d.detail ? `<div style="color:#666;font-size:11px;padding:6px 8px;background:rgba(255,255,255,0.02);border-radius:4px;">📝 ${d.detail}</div>` : ""}
             </div>`;
+        }
+
+        async function loadOpenOrders() {
+            try {
+                const resp = await fetch("/api/trade/open-orders");
+                if (!resp.ok) return;
+                const data = await resp.json();
+                const orders = data.orders || [];
+                const el = document.getElementById("openOrdersTable");
+                const cnt = document.getElementById("openOrdersCount");
+                if (orders.length === 0) {
+                    el.innerHTML = '<div class="empty-msg">无挂单</div>';
+                    cnt.textContent = "";
+                    return;
+                }
+                cnt.textContent = `(${orders.length} 个挂单)`;
+                el.innerHTML = `<table class="trade-log-table">
+                    <thead><tr><th>订单ID</th><th>交易对</th><th>类型</th><th>方向</th><th>数量</th><th>触发价</th><th>限价</th><th>状态</th></tr></thead>
+                    <tbody>${orders.map(o => {
+                        const typeLabel = o.type === "STOP_LOSS" ? "🛡 止损" : o.type === "LIMIT" ? "📌 限价" : o.type;
+                        return `<tr>
+                            <td style="font-size:11px;">${o.orderId}</td>
+                            <td><span class="asset-name">${o.symbol}</span></td>
+                            <td>${typeLabel}</td>
+                            <td style="color:${o.side==='BUY'?'#00d4aa':'#e74c3c'}">${o.side}</td>
+                            <td class="mono">${fmtNum(o.origQty)}</td>
+                            <td class="mono" style="color:#e74c3c;">${o.stopPrice ? '$'+fmtNum(o.stopPrice) : '-'}</td>
+                            <td class="mono">${o.price ? '$'+fmtNum(o.price) : '-'}</td>
+                            <td>${o.status}</td>
+                        </tr>`;
+                    }).join("")}</tbody></table>`;
+            } catch (e) {
+                console.error("Open orders:", e);
+            }
         }
 
         async function loadTradeHistory() {
