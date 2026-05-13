@@ -1,5 +1,6 @@
 import json
 import time
+import math
 import threading
 import collections
 from datetime import datetime
@@ -703,12 +704,19 @@ def _auto_trade_loop(interval):
                         if "." in step_size_str:
                             prec = len(step_size_str.split(".")[1].rstrip("0"))
 
-                        # Calculate minimum viable quantity
+                        # Calculate minimum viable quantity (ceil to avoid rounding down below min)
                         min_qty_for_notional = min_notional / current_price if current_price > 0 else 0
-                        new_qty = round(max(min_qty_for_notional, min_qty, 0), prec)
+                        new_qty = max(min_qty_for_notional, min_qty, 0)
+                        if prec == 0:
+                            new_qty = int(math.ceil(new_qty))
+                        else:
+                            factor = 10 ** prec
+                            new_qty = math.ceil(new_qty * factor) / factor
                         # Round up to step size if needed
                         if step_size > 0 and new_qty % step_size != 0:
-                            new_qty = round(new_qty - (new_qty % step_size) + step_size, prec)
+                            new_qty = math.ceil(new_qty / step_size) * step_size
+                            if prec == 0:
+                                new_qty = int(new_qty)
 
                         if act == "SELL":
                             base_asset = sinfo.get("baseAsset", sym.replace("USDT", ""))
@@ -721,26 +729,28 @@ def _auto_trade_loop(interval):
                                         free = float(b["free"])
                                         locked = float(b["locked"])
                                         break
-                                # If locked by OCO, cancel first to free coins
+                                # Cancel ALL open orders for this symbol if locked
                                 if free < new_qty and locked > 0:
-                                    pos = _auto_state.get("positions", {}).get(sym, {})
-                                    oid = pos.get("stop_order_id")
-                                    if oid:
-                                        try:
-                                            cancel_oco_order(sym, oid)
-                                        except Exception:
+                                    try:
+                                        open_orders = get_open_orders(sym)
+                                        for o in open_orders:
+                                            oid = o.get("orderId")
+                                            olid = o.get("orderListId", -1)
                                             try:
-                                                cancel_order(sym, oid)
+                                                if olid and olid != -1:
+                                                    cancel_oco_order(sym, olid)
+                                                else:
+                                                    cancel_order(sym, oid)
                                             except Exception:
                                                 pass
-                                        try:
-                                            bal_data = get_account()
-                                            for b in bal_data.get("balances", []):
-                                                if b["asset"] == base_asset:
-                                                    free = float(b["free"])
-                                                    break
-                                        except Exception:
-                                            pass
+                                        time.sleep(0.3)
+                                        bal_data = get_account()
+                                        for b in bal_data.get("balances", []):
+                                            if b["asset"] == base_asset:
+                                                free = float(b["free"])
+                                                break
+                                    except Exception:
+                                        pass
                                 if free < new_qty:
                                     new_qty = round(free, prec)
                                 break
@@ -980,9 +990,15 @@ def _execute_one_trade(symbol, action, quantity):
         current_price = 0
 
     if qty * current_price < min_notional:
-        need_qty = round(min_notional / current_price, prec + 1) if current_price > 0 else qty
+        raw_qty = min_notional / current_price if current_price > 0 else qty
+        if prec == 0:
+            need_qty = int(math.ceil(raw_qty))
+            need_str = str(need_qty)
+        else:
+            need_qty = round(math.ceil(raw_qty * (10**prec)) / (10**prec), prec)
+            need_str = f"{need_qty:.{prec}f}".rstrip("0").rstrip(".")
         return {"symbol": symbol, "action": action, "status": "failed",
-                "error": f"金额不足: {action} {qty}≈${qty*current_price:.2f} < 最低${min_notional}。请将quantity改为≥{need_qty}或HOLD"}
+                "error": f"金额不足: {action} {qty}≈${qty*current_price:.2f} < 最低${min_notional}。请将quantity改为≥{need_str}或HOLD"}
 
     if action == "SELL":
         base_asset = sinfo.get("baseAsset", symbol.replace("USDT", ""))
@@ -995,35 +1011,45 @@ def _execute_one_trade(symbol, action, quantity):
                 locked = float(b["locked"])
                 break
 
-        # If coins are locked by OCO, cancel the order to free them
+        # SELL: floor-truncate to step size (can't sell more than you confirm)
+        factor = 10 ** prec
+        qty = math.floor(qty * factor) / factor if prec > 0 else int(math.floor(qty))
+
+        # If coins are locked, cancel ALL open orders for this symbol
         if free < qty and locked > 0:
-            pos = _auto_state.get("positions", {}).get(symbol, {})
-            oid = pos.get("stop_order_id")
-            if oid:
-                try:
-                    cancel_oco_order(symbol, oid)
-                    logger.info("🔓 自动取消OCO %s (ID:%s) 解锁 %s", symbol, oid, locked)
-                except Exception:
+            try:
+                open_orders = get_open_orders(symbol)
+                cancelled = 0
+                for o in open_orders:
+                    oid = o.get("orderId")
+                    olid = o.get("orderListId", -1)
                     try:
-                        cancel_order(symbol, oid)
+                        if olid and olid != -1:
+                            cancel_oco_order(symbol, olid)
+                        else:
+                            cancel_order(symbol, oid)
+                        cancelled += 1
                     except Exception:
                         pass
-                # Refresh balance after cancel
-                try:
-                    bal_data = get_account()
-                    for b in bal_data.get("balances", []):
-                        if b["asset"] == base_asset:
-                            free = float(b["free"])
-                            break
-                except Exception:
-                    pass
+                if cancelled > 0:
+                    logger.info("🔓 %s: 取消%d个挂单解锁", symbol, cancelled)
+                    time.sleep(0.3)  # brief wait for Binance to update
+                    try:
+                        bal_data = get_account()
+                        for b in bal_data.get("balances", []):
+                            if b["asset"] == base_asset:
+                                free = float(b["free"])
+                                break
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.warning("🔓 %s 取消挂单异常: %s", symbol, str(e)[:60])
 
         if free < qty:
-            qty = round(free, prec)
+            qty = math.floor(free * factor) / factor if prec > 0 else int(math.floor(free))
         # If remaining after sell < $15, sell all (avoid dust)
         remaining = free - qty
         if 0 < remaining * current_price < min_notional:
-            import math
             factor = 10 ** prec
             qty = math.floor(free * factor) / factor
             if qty <= 0:

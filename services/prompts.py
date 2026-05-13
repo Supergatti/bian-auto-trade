@@ -58,7 +58,8 @@ DECISION_TEMPLATE = """你是加密货币现货交易分析师。只做现货，
 - 上升趋势→BUY。下降趋势→SELL卖出持仓。震荡→HOLD
 - BUY/SELL必须给stopLossPrice和takeProfitPrice
 - SELL只能卖已有持仓，不能借币做空
-- 已有持仓优先管理（加仓/减仓/清仓）"""
+- 已有持仓优先管理（加仓/减仓/清仓）
+- ⚠ 已有挂单(OCO/止损)的币说明订单已在下，不要重复SELL！等成交/取消后再操作"""
 
 # Flash analysis prompt — text only, no JSON. Pro handles all JSON output.
 FLASH_DECISION_SYSTEM = "用中文总结以下行情数据，400-600字。"
